@@ -146,7 +146,8 @@ int main()
 
     GeneratorSettings settings;
     MapResult map = generateMap(settings);
-    GLuint mapTexture = createTexture(map.size, map.pixels.data());
+    GLuint globeTexture = createTexture(map.size, map.pixels.data());
+    GLuint mercatorTexture = createTexture(map.size, map.mercatorPixels.data());
 
     enum ViewMode { GlobeView = 0, Map2DView = 1 };
     ViewMode viewMode = GlobeView;
@@ -218,14 +219,14 @@ int main()
         if (viewMode == GlobeView)
         {
             setPerspective(45.0f, aspect, 0.1f, 10.0f);
-            drawTexturedSphere(mapTexture, 1.0f, 64, 32, globeYaw, globePitch);
+            drawTexturedSphere(globeTexture, 1.0f, 64, 32, globeYaw, globePitch);
         }
         else
         {
             glMatrixMode(GL_PROJECTION);
             glLoadIdentity();
             glOrtho(-aspect, aspect, -1.0f, 1.0f, 0.1f, 10.0f);
-            drawFlatMap(mapTexture, aspect);
+            drawFlatMap(mercatorTexture, aspect);
         }
 
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
@@ -239,15 +240,16 @@ int main()
         ImGui::SameLine();
         ImGui::RadioButton("2-D Map", reinterpret_cast<int*>(&viewMode), Map2DView);
         ImGui::Spacing();
-        ImGui::SliderInt("Map Size", &settings.mapSize, 128, 512);
-        ImGui::SliderInt("Plate Count", &settings.plateCount, 2, 16);
+        ImGui::SliderInt("Map Size", &settings.mapSize, 128, 2048);
+        ImGui::SliderInt("Plate Count", &settings.plateCount, 2, 64);
         ImGui::SliderInt("Fault Thickness", &settings.faultIntensity, 1, 6);
         ImGui::InputScalar("Seed", ImGuiDataType_U32, &settings.seed);
 
         if (ImGui::Button("Generate"))
         {
             map = generateMap(settings);
-            updateTexture(mapTexture, map.size, map.pixels.data());
+            updateTexture(globeTexture, map.size, map.pixels.data());
+            updateTexture(mercatorTexture, map.size, map.mercatorPixels.data());
         }
 
         ImGui::Checkbox("Auto Rotate", &rotateGlobe);
@@ -264,7 +266,8 @@ int main()
         glfwSwapBuffers(window);
     }
 
-    glDeleteTextures(1, &mapTexture);
+    glDeleteTextures(1, &globeTexture);
+    glDeleteTextures(1, &mercatorTexture);
     ImGui_ImplOpenGL2_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

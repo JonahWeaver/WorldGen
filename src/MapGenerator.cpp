@@ -9,24 +9,64 @@ namespace {
 
 struct Point { int x; int y; };
 
+struct SphereDir { float x; float y; float z; };
+
+static constexpr float PI = 3.14159265358979323846f;
+
 uint32_t rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255)
 {
     return (uint32_t)a << 24 | (uint32_t)b << 16 | (uint32_t)g << 8 | r;
 }
 
+SphereDir toSphereDirection(int x, int y, int size)
+{
+    float lon = 2.0f * PI * (static_cast<float>(x) / size);
+    float lat = PI * (0.5f - static_cast<float>(y) / size);
+    float cosLat = std::cos(lat);
+    return { cosLat * std::cos(lon), std::sin(lat), cosLat * std::sin(lon) };
+}
+
+inline float chordDistanceSquared(const SphereDir& a, const SphereDir& b)
+{
+    float dx = a.x - b.x;
+    float dy = a.y - b.y;
+    float dz = a.z - b.z;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+static uint32_t hsvToRgba(float h, float s, float v)
+{
+    h = std::fmod(h, 360.0f);
+    if (h < 0.0f) h += 360.0f;
+    float c = v * s;
+    float x = c * (1.0f - std::fabs(std::fmod(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+
+    if (h < 60.0f) { r = c; g = x; b = 0.0f; }
+    else if (h < 120.0f) { r = x; g = c; b = 0.0f; }
+    else if (h < 180.0f) { r = 0.0f; g = c; b = x; }
+    else if (h < 240.0f) { r = 0.0f; g = x; b = c; }
+    else if (h < 300.0f) { r = x; g = 0.0f; b = c; }
+    else { r = c; g = 0.0f; b = x; }
+
+    return rgba(
+        static_cast<uint8_t>(std::clamp<int>(static_cast<int>((r + m) * 255.0f), 0, 255)),
+        static_cast<uint8_t>(std::clamp<int>(static_cast<int>((g + m) * 255.0f), 0, 255)),
+        static_cast<uint8_t>(std::clamp<int>(static_cast<int>((b + m) * 255.0f), 0, 255)));
+}
+
 std::vector<uint32_t> buildPalette(int count)
 {
-    static const std::vector<uint32_t> baseColors = {
-        rgba(63, 125, 187), rgba(169, 96, 47), rgba(118, 183, 84),
-        rgba(167, 80, 159), rgba(214, 170, 71), rgba(94, 125, 76),
-        rgba(187, 108, 57), rgba(110, 150, 170), rgba(143, 99, 124),
-        rgba(156, 169, 99)
-    };
-
     std::vector<uint32_t> palette;
     palette.reserve(count);
     for (int i = 0; i < count; ++i)
-        palette.push_back(baseColors[i % static_cast<int>(baseColors.size())]);
+    {
+        float hue = 360.0f * i / static_cast<float>(count);
+        float saturation = 0.65f + 0.25f * (static_cast<float>((i % 4) / 3));
+        float value = 0.75f + 0.20f * (static_cast<float>(((i / 4) % 2)));
+        palette.push_back(hsvToRgba(hue, saturation, value));
+    }
     return palette;
 }
 
@@ -65,28 +105,28 @@ bool isBoundary(int x, int y, int size, const std::vector<int>& plateIndex)
 MapResult generateMap(const GeneratorSettings& settings)
 {
     int size = std::clamp(settings.mapSize, 64, 512);
-    int plateCount = std::clamp(settings.plateCount, 2, 24);
+    int plateCount = std::clamp(settings.plateCount, 2, 64);
     int thickness = std::clamp(settings.faultIntensity, 1, 8);
 
     std::mt19937 rng(settings.seed ? settings.seed : static_cast<unsigned int>(std::random_device{}()));
     std::uniform_int_distribution<int> posDist(0, size - 1);
 
-    std::vector<Point> seeds;
+    std::vector<SphereDir> seeds;
     seeds.reserve(plateCount);
     for (int i = 0; i < plateCount; ++i)
-        seeds.push_back({ posDist(rng), posDist(rng) });
+        seeds.push_back(toSphereDirection(posDist(rng), posDist(rng), size));
 
     std::vector<int> plateIndex(size * size);
     for (int y = 0; y < size; ++y)
     {
         for (int x = 0; x < size; ++x)
         {
-            Point cell { x, y };
+            SphereDir cellDir = toSphereDirection(x, y, size);
             int best = 0;
-            int bestDistance = squaredDistanceWrappedX(cell, seeds[0], size);
+            float bestDistance = chordDistanceSquared(cellDir, seeds[0]);
             for (int i = 1; i < plateCount; ++i)
             {
-                int distance = squaredDistanceWrappedX(cell, seeds[i], size);
+                float distance = chordDistanceSquared(cellDir, seeds[i]);
                 if (distance < bestDistance)
                 {
                     bestDistance = distance;
@@ -142,5 +182,19 @@ MapResult generateMap(const GeneratorSettings& settings)
         }
     }
 
-    return MapResult{ size, std::move(pixels) };
+    std::vector<uint32_t> mercatorPixels(size * size);
+    for (int y = 0; y < size; ++y)
+    {
+        float t = (static_cast<float>(y) + 0.5f) / size;
+        float mercatorLat = std::atan(std::sinh(PI * (1.0f - 2.0f * t)));
+        float sourceV = 0.5f - mercatorLat / PI;
+        int sourceY = std::clamp(static_cast<int>(sourceV * size), 0, size - 1);
+
+        for (int x = 0; x < size; ++x)
+        {
+            mercatorPixels[y * size + x] = pixels[sourceY * size + x];
+        }
+    }
+
+    return MapResult{ size, std::move(pixels), std::move(mercatorPixels) };
 }

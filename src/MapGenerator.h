@@ -15,6 +15,7 @@ struct MapResult
 {
     int size = 0;
     std::vector<uint32_t> pixels;
+    std::vector<uint32_t> mercatorPixels;
 };
 
 MapResult generateMap(const GeneratorSettings& settings);
