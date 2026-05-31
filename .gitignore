@@ -1,0 +1,14 @@
+# Build artifacts
+build/
+
+# IDE files
+*.vcxproj*
+*.sln
+*.user
+*.opensdf
+*.ipch
+*.pdb
+
+# OS files
+.DS_Store
+Thumbs.db
