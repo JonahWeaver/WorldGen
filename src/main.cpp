@@ -10,6 +10,7 @@
 
 #include "MapGenerator.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -47,7 +48,7 @@ static void setPerspective(float fovY, float aspect, float zNear, float zFar)
     glFrustum(-width, width, -height, height, zNear, zFar);
 }
 
-static void drawTexturedSphere(GLuint texture, float radius, int lonSegments, int latSegments, float rotationDegrees)
+static void drawTexturedSphere(GLuint texture, float radius, int lonSegments, int latSegments, float yawDegrees, float pitchDegrees)
 {
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_TEXTURE_2D);
@@ -57,8 +58,8 @@ static void drawTexturedSphere(GLuint texture, float radius, int lonSegments, in
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     glTranslatef(0.0f, 0.0f, -3.0f);
-    glRotatef(15.0f, 1.0f, 0.0f, 0.0f);
-    glRotatef(rotationDegrees, 0.0f, 1.0f, 0.0f);
+    glRotatef(pitchDegrees, 1.0f, 0.0f, 0.0f);
+    glRotatef(yawDegrees, 0.0f, 1.0f, 0.0f);
 
     constexpr float PI = 3.14159265358979323846f;
     for (int i = 0; i < latSegments; ++i)
@@ -88,6 +89,28 @@ static void drawTexturedSphere(GLuint texture, float radius, int lonSegments, in
 
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_DEPTH_TEST);
+}
+
+static void drawFlatMap(GLuint texture, float aspect)
+{
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glColor3f(1.0f, 1.0f, 1.0f);
+
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    float width = 1.6f;
+    float height = width / aspect;
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0f, 1.0f); glVertex3f(-width, -height, -3.0f);
+    glTexCoord2f(1.0f, 1.0f); glVertex3f(width, -height, -3.0f);
+    glTexCoord2f(1.0f, 0.0f); glVertex3f(width, height, -3.0f);
+    glTexCoord2f(0.0f, 0.0f); glVertex3f(-width, height, -3.0f);
+    glEnd();
+
+    glDisable(GL_TEXTURE_2D);
 }
 
 int main()
@@ -125,7 +148,13 @@ int main()
     MapResult map = generateMap(settings);
     GLuint mapTexture = createTexture(map.size, map.pixels.data());
 
-    float globeRotation = 0.0f;
+    enum ViewMode { GlobeView = 0, Map2DView = 1 };
+    ViewMode viewMode = GlobeView;
+    float globeYaw = 0.0f;
+    float globePitch = 15.0f;
+    bool mouseDragging = false;
+    double lastMouseX = 0.0;
+    double lastMouseY = 0.0;
     bool rotateGlobe = true;
     float rotationSpeed = 18.0f;
     double lastTime = glfwGetTime();
@@ -135,8 +164,41 @@ int main()
         double currentTime = glfwGetTime();
         float deltaTime = static_cast<float>(currentTime - lastTime);
         lastTime = currentTime;
-        if (rotateGlobe)
-            globeRotation = std::fmod(globeRotation + rotationSpeed * deltaTime, 360.0f);
+
+        ImGuiIO& io = ImGui::GetIO();
+        double mouseX = 0.0;
+        double mouseY = 0.0;
+        glfwGetCursorPos(window, &mouseX, &mouseY);
+        int leftDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT);
+
+        if (leftDown == GLFW_PRESS && !io.WantCaptureMouse && viewMode == GlobeView)
+        {
+            if (!mouseDragging)
+            {
+                mouseDragging = true;
+                lastMouseX = mouseX;
+                lastMouseY = mouseY;
+            }
+            else
+            {
+                float dx = static_cast<float>(mouseX - lastMouseX);
+                float dy = static_cast<float>(mouseY - lastMouseY);
+                globeYaw += dx * 0.4f;
+                globePitch += dy * 0.3f;
+                globePitch = std::clamp(globePitch, -89.0f, 89.0f);
+                lastMouseX = mouseX;
+                lastMouseY = mouseY;
+            }
+            rotateGlobe = false;
+        }
+        else
+        {
+            mouseDragging = false;
+            if (rotateGlobe && viewMode == GlobeView)
+            {
+                globeYaw = std::fmod(globeYaw + rotationSpeed * deltaTime, 360.0f);
+            }
+        }
 
         glfwPollEvents();
         ImGui_ImplOpenGL2_NewFrame();
@@ -152,9 +214,19 @@ int main()
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
         float aspect = displayW > 0 && displayH > 0 ? static_cast<float>(displayW) / static_cast<float>(displayH) : 1.0f;
-        setPerspective(45.0f, aspect, 0.1f, 10.0f);
 
-        drawTexturedSphere(mapTexture, 1.0f, 64, 32, globeRotation);
+        if (viewMode == GlobeView)
+        {
+            setPerspective(45.0f, aspect, 0.1f, 10.0f);
+            drawTexturedSphere(mapTexture, 1.0f, 64, 32, globeYaw, globePitch);
+        }
+        else
+        {
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            glOrtho(-aspect, aspect, -1.0f, 1.0f, 0.1f, 10.0f);
+            drawFlatMap(mapTexture, aspect);
+        }
 
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(340, 320), ImGuiCond_Always);
@@ -162,7 +234,10 @@ int main()
             ImGuiWindowFlags_AlwaysAutoResize |
             ImGuiWindowFlags_NoCollapse |
             ImGuiWindowFlags_NoSavedSettings);
-        ImGui::TextWrapped("Generate tectonic plates on a globe and adjust the settings.");
+        ImGui::TextWrapped("Generate tectonic plates and choose the main display mode.");
+        ImGui::RadioButton("Globe", reinterpret_cast<int*>(&viewMode), GlobeView);
+        ImGui::SameLine();
+        ImGui::RadioButton("2-D Map", reinterpret_cast<int*>(&viewMode), Map2DView);
         ImGui::Spacing();
         ImGui::SliderInt("Map Size", &settings.mapSize, 128, 512);
         ImGui::SliderInt("Plate Count", &settings.plateCount, 2, 16);
