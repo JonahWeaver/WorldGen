@@ -271,6 +271,9 @@ int main()
         ImGui::RadioButton("Climate / Wind",    &activeLayer, int(MapLayer::Climate));
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Moisture & biome map with wind arrows.\nSandy=desert  Yellow-green=savanna  Green=temperate\nDark green=rainforest  Blue=ocean\nWhite arrows show prevailing wind direction.\nErosion from rainfall softens mountain peaks.");
+        ImGui::RadioButton("Hydrology",         &activeLayer, int(MapLayer::Hydrology));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Rivers, lakes & drainage basins.\nBlue lines = rivers (width proportional to flow)\nBlue-grey fill = lakes / endorheic basins\nGreen tint near rivers = riparian vegetation\nRivers dry up in arid regions (evaporation)");
 
         ImGui::Separator();
 

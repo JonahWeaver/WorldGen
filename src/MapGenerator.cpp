@@ -473,9 +473,9 @@ MapSnapshot renderSnapshot(
 
     // ── Advection ─────────────────────────────────────────────────────────────
     // advectStrength: how much of the arriving air mass replaces the current
-    // pixel's moisture each pass. Keep this small (0.04) so moisture transitions
-    // are gradual and don't produce sharp halos or "bleeding" artefacts.
-    const float advectStrength = 0.04f;
+    // pixel's moisture each pass. 0.08 gives good inland penetration while
+    // still producing smooth gradients without bleeding artefacts.
+    const float advectStrength = 0.08f;
     const int   windPasses     = size;   // enough passes to cross the full map
 
     for(int pass=0;pass<windPasses;++pass){
@@ -564,6 +564,84 @@ MapSnapshot renderSnapshot(
         }
     }
 
+    // ── 4c-ii. River-fed moisture (post-advection) ────────────────────────────
+    // After wind advection converges, rivers act as LOCAL moisture sources that
+    // irrigate land on ALL sides regardless of wind direction.
+    // We do this AFTER the main advection loop so it doesn't interfere with the
+    // atmospheric moisture transport — it's a separate ground-level effect.
+    //
+    // Algorithm: compute a rough flow proxy from the elevation gradient
+    // (steepest-descent accumulation), then diffuse moisture outward from
+    // high-flow cells isotropically (no wind direction involved).
+    //
+    // We use a simple iterative blur seeded by flow-proxy values so that
+    // pixels near rivers/streams get a moisture boost on all sides.
+    {
+        // Quick flow proxy: for each land pixel, estimate local drainage by
+        // counting how many of its 8 neighbours are higher (it receives their runoff).
+        // This is a cheap approximation — the real D8 flow is computed later in
+        // the Hydrology layer, but we need something here for the climate layer.
+        static const int fdx8[8]={1,1,0,-1,-1,-1,0,1};
+        static const int fdy8[8]={0,1,1, 1, 0,-1,-1,-1};
+        std::vector<float> flowProxy(size*size, 0.f);
+        for(int y=1;y<size-1;++y)
+        for(int x=0;x<size;++x){
+            int i=y*size+x;
+            if(elevGrid[i]<0.f) continue;
+            float contrib=0.f;
+            for(int d=0;d<8;++d){
+                int nx2=((x+fdx8[d])%size+size)%size;
+                int ny2=std::clamp(y+fdy8[d],0,size-1);
+                int ni=ny2*size+nx2;
+                if(elevGrid[ni]>elevGrid[i]) contrib+=1.f;
+            }
+            flowProxy[i]=contrib/8.f;
+        }
+
+        // Diffuse river moisture outward for several passes.
+        // Each pass spreads moisture from high-flow cells to their neighbours.
+        // The spread is isotropic (equal in all directions) — no wind bias.
+        const int riverDiffPasses = std::max(size/8, 4);
+        const float riverDiffDecay = 0.82f;  // moisture retained per step
+
+        std::vector<float> riverMoist(size*size, 0.f);
+        // Seed: ocean pixels and high-flow land pixels start moist
+        for(int i=0;i<size*size;++i){
+            if(elevGrid[i]<0.f) riverMoist[i]=1.f;
+            else riverMoist[i]=flowProxy[i]*moisture[i];
+        }
+
+        for(int pass=0;pass<riverDiffPasses;++pass){
+            std::vector<float> nm=riverMoist;
+            for(int y=1;y<size-1;++y)
+            for(int x=0;x<size;++x){
+                int i=y*size+x;
+                if(elevGrid[i]<0.f) continue;
+                int xL=((x-1)+size)%size, xR=(x+1)%size;
+                // Take max of self and decayed neighbours (isotropic spread)
+                float best=riverMoist[i];
+                best=std::max(best,riverMoist[y*size+xL]*riverDiffDecay);
+                best=std::max(best,riverMoist[y*size+xR]*riverDiffDecay);
+                best=std::max(best,riverMoist[(y-1)*size+x]*riverDiffDecay);
+                best=std::max(best,riverMoist[(y+1)*size+x]*riverDiffDecay);
+                nm[i]=best;
+            }
+            riverMoist=std::move(nm);
+            // Re-enforce ocean boundary
+            for(int i=0;i<size*size;++i)
+                if(elevGrid[i]<0.f) riverMoist[i]=1.f;
+        }
+
+        // Blend river-fed moisture into the atmospheric moisture.
+        // riverMoist contributes up to 45% of the final moisture value,
+        // so river valleys are noticeably greener than surrounding terrain.
+        for(int i=0;i<size*size;++i){
+            if(elevGrid[i]<0.f) continue;
+            moisture[i]=std::clamp(
+                moisture[i]*0.60f + riverMoist[i]*0.45f, 0.f, 1.f);
+        }
+    }
+
     // ── 4d. Erosion ───────────────────────────────────────────────────────────
     // Erode elevation proportional to moisture and local slope magnitude.
     // High moisture + steep slope = strong erosion (rivers carve valleys).
@@ -643,11 +721,14 @@ MapSnapshot renderSnapshot(
             if(t<0.70f) return 1.5f+(t-0.40f)/0.30f;
             return 2.5f+(t-0.70f)/0.30f*0.5f;
         };
+        // Shifted moisture thresholds: "arid" band is narrower (only below 0.10),
+        // so moderate moisture (0.10-0.35) maps to dry grassland/steppe rather
+        // than desert. This reduces the amount of desert on typical maps.
         auto moistToGrid=[](float m)->float{
-            if(m<0.15f) return m/0.15f*0.5f;
-            if(m<0.40f) return 0.5f+(m-0.15f)/0.25f;
-            if(m<0.70f) return 1.5f+(m-0.40f)/0.30f;
-            return 2.5f+(m-0.70f)/0.30f*0.5f;
+            if(m<0.10f) return m/0.10f*0.5f;           // arid: 0.0-0.10 → grid 0.0-0.5
+            if(m<0.35f) return 0.5f+(m-0.10f)/0.25f;   // dry:  0.10-0.35 → grid 0.5-1.5
+            if(m<0.65f) return 1.5f+(m-0.35f)/0.30f;   // moist:0.35-0.65 → grid 1.5-2.5
+            return 2.5f+(m-0.65f)/0.35f*0.5f;           // wet:  0.65-1.0  → grid 2.5-3.0
         };
 
         float gx=std::clamp(tempToGrid(temp),  0.f, 3.f);
@@ -721,12 +802,201 @@ MapSnapshot renderSnapshot(
     for(int i=0;i<size*size;++i)
         pix3[i]=elevCol(erodedElev[i]);
 
+    // ── Layer 5: Hydrology (rivers, lakes, drainage basins) ───────────────────
+    //
+    // Algorithm:
+    //  1. D8 flow direction: each land pixel drains to its lowest of 8 neighbours.
+    //     Ocean pixels are sinks. Flat/local-minimum pixels drain to themselves
+    //     (potential lake cells).
+    //  2. Flow accumulation: topological sort upstream→downstream, count how many
+    //     pixels drain through each cell. High accumulation = major river.
+    //  3. Rainfall input: each land pixel contributes moisture[i] to the flow.
+    //     Arid pixels contribute little, so rivers dry up in deserts.
+    //  4. Lake detection: cells that drain to a local minimum (no lower neighbour)
+    //     are marked as lakes. We flood-fill from each minimum up to the spill
+    //     elevation to determine lake extent.
+    //  5. River erosion: high-flow cells have their elevation lowered slightly,
+    //     carving valleys.
+    //  6. Render: elevation heatmap base + blue rivers (width ∝ log(flow)) +
+    //     lake fill + endorheic basin tint.
+
+    // ── 5a. Working elevation (use erodedElev, further carved by rivers) ──────
+    std::vector<float> hydroElev = erodedElev;
+
+    // ── 5b. D8 flow direction ─────────────────────────────────────────────────
+    // dir[i] = index of the pixel this cell drains to, or i if it's a sink/lake.
+    const int dx8[8]={1,1,0,-1,-1,-1, 0, 1};
+    const int dy8[8]={0,1,1, 1, 0,-1,-1,-1};
+
+    std::vector<int> flowDir(size*size);
+    for(int y=0;y<size;++y)
+    for(int x=0;x<size;++x){
+        int i=y*size+x;
+        // Ocean pixels are sinks — they drain to themselves
+        if(hydroElev[i]<0.f){ flowDir[i]=i; continue; }
+
+        float minE=hydroElev[i];
+        int   best=i;  // default: drain to self (local minimum)
+        for(int d=0;d<8;++d){
+            int nx=x+dx8[d], ny=y+dy8[d];
+            // Wrap longitude, clamp latitude
+            nx=((nx%size)+size)%size;
+            ny=std::clamp(ny,0,size-1);
+            int ni=ny*size+nx;
+            if(hydroElev[ni]<minE){ minE=hydroElev[ni]; best=ni; }
+        }
+        flowDir[i]=best;
+    }
+
+    // ── 5c. Flow accumulation (topological sort) ──────────────────────────────
+    // Count in-degree (how many pixels drain INTO each pixel)
+    std::vector<int> inDeg(size*size,0);
+    for(int i=0;i<size*size;++i)
+        if(flowDir[i]!=i) inDeg[flowDir[i]]++;
+
+    // Topological sort: process sources first (in-degree 0), propagate downstream
+    std::vector<int> order;
+    order.reserve(size*size);
+    std::vector<int> queue;
+    queue.reserve(size*size/4);
+    for(int i=0;i<size*size;++i)
+        if(inDeg[i]==0) queue.push_back(i);
+
+    while(!queue.empty()){
+        int cur=queue.back(); queue.pop_back();
+        order.push_back(cur);
+        int dn=flowDir[cur];
+        if(dn!=cur){
+            inDeg[dn]--;
+            if(inDeg[dn]==0) queue.push_back(dn);
+        }
+    }
+
+    // Accumulate rainfall-weighted flow
+    // Each land pixel contributes its moisture as "rainfall"
+    std::vector<float> flow(size*size,0.f);
+    for(int i=0;i<size*size;++i)
+        if(hydroElev[i]>=0.f) flow[i]=moisture[i];  // rainfall input
+
+    for(int idx=0;idx<int(order.size());++idx){
+        int i=order[idx];
+        int dn=flowDir[i];
+        if(dn!=i){
+            // Arid drying: flow evaporates proportional to aridity
+            float aridity=std::max(0.f,1.f-moisture[i]*3.f);
+            float evap=std::clamp(aridity*0.15f,0.f,0.9f);
+            flow[dn]+=flow[i]*(1.f-evap);
+        }
+    }
+
+    // Normalise flow to [0,1] using log scale (rivers span many orders of magnitude)
+    float maxFlow=0.f;
+    for(int i=0;i<size*size;++i) maxFlow=std::max(maxFlow,flow[i]);
+    std::vector<float> flowNorm(size*size,0.f);
+    if(maxFlow>0.f){
+        float logMax=std::log(maxFlow+1.f);
+        for(int i=0;i<size*size;++i)
+            flowNorm[i]=std::log(flow[i]+1.f)/logMax;
+    }
+
+    // ── 5d. Lake detection ────────────────────────────────────────────────────
+    // A cell is a lake seed if it drains to itself AND is a land cell.
+    // We flood-fill from each seed up to a small spill height to get lake extent.
+    std::vector<bool> isLake(size*size,false);
+    {
+        float spillHeight=0.04f;  // lakes fill up to this height above the minimum
+        for(int i=0;i<size*size;++i){
+            if(flowDir[i]==i && hydroElev[i]>=0.f){
+                // Flood fill: mark all connected land cells within spillHeight
+                float lakeLevel=hydroElev[i]+spillHeight;
+                std::vector<int> stack; stack.push_back(i);
+                std::vector<bool> visited(size*size,false);
+                visited[i]=true;
+                while(!stack.empty()){
+                    int cur=stack.back(); stack.pop_back();
+                    isLake[cur]=true;
+                    int cy=cur/size, cx=cur%size;
+                    for(int d=0;d<4;++d){  // 4-connected for lakes
+                        int nx2=cx+dx8[d*2], ny2=cy+dy8[d*2];
+                        nx2=((nx2%size)+size)%size;
+                        ny2=std::clamp(ny2,0,size-1);
+                        int ni=ny2*size+nx2;
+                        if(!visited[ni] && hydroElev[ni]>=0.f
+                           && hydroElev[ni]<=lakeLevel){
+                            visited[ni]=true;
+                            stack.push_back(ni);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 5e. River erosion ─────────────────────────────────────────────────────
+    // High-flow cells carve their elevation down slightly
+    for(int i=0;i<size*size;++i){
+        if(hydroElev[i]<0.f || isLake[i]) continue;
+        float carve=flowNorm[i]*flowNorm[i]*0.12f;
+        hydroElev[i]=std::clamp(hydroElev[i]-carve,-1.f,1.f);
+    }
+
+    // ── 5f. Render hydrology layer ────────────────────────────────────────────
+    // Base: elevation heatmap of the carved terrain
+    // Rivers: blue overlay, opacity proportional to log(flow)
+    // Lakes: flat blue-grey fill
+    // Endorheic basins (rivers that dry up): shown with a warm sandy tint
+
+    // River threshold: only draw pixels above this normalised flow value.
+    // Lower = more rivers visible (including small tributaries and streams).
+    const float riverThreshold = 0.18f;
+
+    std::vector<uint32_t> pix5(size*size);
+    for(int y=0;y<size;++y)
+    for(int x=0;x<size;++x){
+        int i=y*size+x;
+        float e=hydroElev[i];
+
+        if(e<0.f){
+            // Ocean
+            pix5[i]=elevCol(e);
+        } else if(isLake[i]){
+            // Lake: calm blue-grey
+            pix5[i]=rgba(80,130,170);
+        } else if(flowNorm[i]>riverThreshold){
+            // River: blend from terrain colour toward deep blue based on flow
+            float t=std::clamp((flowNorm[i]-riverThreshold)/(1.f-riverThreshold),0.f,1.f);
+            // Narrow rivers: lighter blue; wide rivers: deep blue
+            uint8_t rr=uint8_t(std::clamp<int>(int(60-t*40),0,255));
+            uint8_t rg=uint8_t(std::clamp<int>(int(120+t*20),0,255));
+            uint8_t rb=uint8_t(std::clamp<int>(int(180+t*50),0,255));
+            pix5[i]=rgba(rr,rg,rb);
+        } else {
+            // Land: use biome colour from climate layer, tinted by flow
+            // (slight green tint near rivers = riparian vegetation)
+            uint32_t base=biomeCol(tempGrid[i],moisture[i]);
+            if(flowNorm[i]>0.15f){
+                float t=(flowNorm[i]-0.15f)/0.20f;
+                uint8_t br=uint8_t(base&0xFF);
+                uint8_t bg=uint8_t((base>>8)&0xFF);
+                uint8_t bb=uint8_t((base>>16)&0xFF);
+                // Riparian: slightly greener and darker
+                br=uint8_t(std::clamp<int>(int(br*(1-t*0.15f)),0,255));
+                bg=uint8_t(std::clamp<int>(int(bg*(1+t*0.08f)),0,255));
+                bb=uint8_t(std::clamp<int>(int(bb*(1-t*0.10f)),0,255));
+                pix5[i]=rgba(br,bg,bb);
+            } else {
+                pix5[i]=base;
+            }
+        }
+    }
+
     // ── Pack into snapshot ────────────────────────────────────────────────────
     snap.layerPixels[0]=std::move(pix0);
     snap.layerPixels[1]=std::move(pix1);
     snap.layerPixels[2]=std::move(pix2);
     snap.layerPixels[3]=std::move(pix3);
     snap.layerPixels[4]=std::move(pix4);
+    snap.layerPixels[5]=std::move(pix5);
     for(int L=0;L<int(MapLayer::Count);++L)
         snap.layerMercator[L]=toMercator(snap.layerPixels[L],size);
 

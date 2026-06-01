@@ -25,7 +25,8 @@ enum class MapLayer
     CollisionEffects = 2,  // plate colours + halo terrain effects at boundaries
     Elevation        = 3,  // topographic heatmap (deep ocean -> coast -> highland -> peak)
     Climate          = 4,  // moisture/rainfall heatmap + wind direction arrows + erosion
-    Count            = 5
+    Hydrology        = 5,  // rivers, lakes, drainage basins, endorheic drying
+    Count            = 6
 };
 
 // One point-in-time snapshot of the world.
