@@ -356,11 +356,377 @@ MapSnapshot renderSnapshot(
         pix3[i]=elevCol(elev);
     }
 
+    // ── Layer 4: Climate (wind + moisture + erosion) ──────────────────────────
+    //
+    // Step 1 — Elevation field (reuse pix3 data via a float buffer)
+    //   We already have pix3 as RGBA; rebuild a float elevation grid here.
+    //
+    // Step 2 — Wind vectors from latitude (Hadley/Ferrel/Polar cells + Coriolis)
+    //   Each pixel gets (wx, wy) in equirectangular map space.
+    //
+    // Step 3 — Moisture transport
+    //   Start with ocean pixels fully moist. March along wind direction,
+    //   depositing moisture when air rises (orographic lift) and drying out
+    //   on the leeward side (rain shadow).
+    //
+    // Step 4 — Erosion
+    //   Erode the elevation proportional to moisture × local slope.
+    //   This softens mountain peaks and fills valleys in wet regions.
+    //
+    // Step 5 — Render climate layer
+    //   Colour by moisture: desert (sandy) → savanna → temperate → rainforest (deep green)
+    //   Overlay wind arrows every N pixels.
+
+    // ── 4a. Float elevation grid ──────────────────────────────────────────────
+    std::vector<float> elevGrid(size*size);
+    for(int y=0;y<size;++y)
+    for(int x=0;x<size;++x){
+        int i=y*size+x; int pl=pi1[i]; float ep=bd[i];
+        float elev=baseElev[pl];
+        if(isBnd(i)){
+            int bc=btype(i);
+            if(bc==0&&ep<eHC){float t=1-ep/eHC; elev+=t*t*0.70f;}
+            else if(bc==2&&ep<eHD){float t=1-ep/eHD; elev-=t*t*0.55f;}
+            else if(bc==1&&ep<eHT){float t=1-ep/eHT; elev-=t*0.15f;}
+        }
+        SphereDir cd=toSphereDirection(float(x),float(y),size);
+        float coarse=(valueNoise3D(cd.x*3,cd.y*3,cd.z*3,enSeed)*2-1)
+                    +(valueNoise3D(cd.x*6,cd.y*6,cd.z*6,enSeed+1u)-0.5f);
+        float fine  =(valueNoise3D(cd.x*14,cd.y*14,cd.z*14,enSeed+2u)*2-1)*0.5f
+                    +(valueNoise3D(cd.x*28,cd.y*28,cd.z*28,enSeed+3u)*2-1)*0.25f;
+        elevGrid[i]=std::clamp(elev+coarse*0.18f+fine*0.08f,-1.f,1.f);
+    }
+
+    // ── 4b. Wind vectors ──────────────────────────────────────────────────────
+    // Latitude in [-PI/2, PI/2]; y=0 is north pole in equirectangular.
+    // wx = east component, wy = south component (positive = southward in image).
+    // Hadley cell  (|lat|<30°): easterly trade winds  → wx<0, wy toward equator
+    // Ferrel cell  (30-60°):    westerlies             → wx>0, wy toward poles
+    // Polar cell   (>60°):      polar easterlies       → wx<0, wy toward equator
+    // Coriolis deflects N-hemi rightward, S-hemi leftward.
+    unsigned int windSeed = seed ^ 0xBADF00Du;
+    std::vector<float> wx(size*size), wy(size*size);
+    for(int y=0;y<size;++y){
+        // latitude: top of image = +PI/2 (north pole)
+        float lat = PI*(0.5f - float(y)/float(size));  // [-PI/2, PI/2]
+        float absLat = std::fabs(lat);
+        float latDeg = absLat * 180.f / PI;
+        float sign   = (lat >= 0.f) ? 1.f : -1.f;  // +1 north, -1 south
+
+        // Base zonal (east-west) and meridional (north-south) components
+        float baseWx, baseWy;
+        if(latDeg < 30.f){
+            // Trade winds: blow westward (wx<0) and toward equator
+            float t = latDeg / 30.f;
+            baseWx = -1.0f;                      // easterly
+            baseWy =  sign * t * 0.3f;           // slight equatorward drift
+        } else if(latDeg < 60.f){
+            // Westerlies: blow eastward (wx>0) and poleward
+            float t = (latDeg-30.f)/30.f;
+            baseWx =  1.0f;                      // westerly
+            baseWy = -sign * t * 0.3f;           // slight poleward drift
+        } else {
+            // Polar easterlies: blow westward and equatorward
+            float t = (latDeg-60.f)/30.f;
+            baseWx = -0.6f;
+            baseWy =  sign * t * 0.2f;
+        }
+
+        for(int x=0;x<size;++x){
+            int i=y*size+x;
+            // Add low-frequency weather noise (large-scale pressure systems)
+            float nx = valueNoise3D(float(x)*0.03f, float(y)*0.03f, 0.f, windSeed+0u)*2-1;
+            float ny = valueNoise3D(float(x)*0.03f, float(y)*0.03f, 0.f, windSeed+1u)*2-1;
+            wx[i] = baseWx + nx*0.4f;
+            wy[i] = baseWy + ny*0.4f;
+            // Normalise to unit length
+            float len=std::sqrt(wx[i]*wx[i]+wy[i]*wy[i]);
+            if(len>0){wx[i]/=len; wy[i]/=len;}
+        }
+    }
+
+    // ── 4c. Moisture transport ────────────────────────────────────────────────
+    // Full two-way advection: winds carry BOTH moist and dry air.
+    //
+    // Key insight: we use a weighted blend (not max) so that dry air arriving
+    // from a continental interior or polar region can DISPLACE moist air and
+    // actually dry out a region — just like the Atacama/Namib deserts form
+    // when dry trade winds blow off hot continents toward the coast.
+    //
+    // Initialisation: ocean=1.0 (saturated), land seeded with a small base
+    // moisture proportional to proximity to ocean (so the starting state is
+    // physically reasonable before advection begins).
+    //
+    // Each pass: every land pixel blends its current moisture with the
+    // moisture arriving from 1 pixel upwind. The blend weight controls how
+    // quickly the air mass is replaced (advection strength).
+    //
+    // Orographic lift: upslope air loses moisture (rain); downslope air
+    // descends and warms (föhn effect) — it arrives drier than it left.
+    //
+    // Lateral diffusion every 8 passes breaks up linear streaks.
+
+    // ── Seed moisture: ocean=1, land=small base value ─────────────────────────
+    std::vector<float> moisture(size*size, 0.f);
+    for(int i=0;i<size*size;++i)
+        moisture[i] = (elevGrid[i] < 0.f) ? 1.f : 0.05f;
+
+    // ── Advection ─────────────────────────────────────────────────────────────
+    // advectStrength: how much of the arriving air mass replaces the current
+    // pixel's moisture each pass. Keep this small (0.04) so moisture transitions
+    // are gradual and don't produce sharp halos or "bleeding" artefacts.
+    const float advectStrength = 0.04f;
+    const int   windPasses     = size;   // enough passes to cross the full map
+
+    for(int pass=0;pass<windPasses;++pass){
+        std::vector<float> newMoisture = moisture;
+
+        for(int y=0;y<size;++y)
+        for(int x=0;x<size;++x){
+            int i=y*size+x;
+            // Ocean is always fully saturated — it is the boundary condition.
+            if(elevGrid[i]<0.f){ newMoisture[i]=1.f; continue; }
+
+            // Sample moisture 1 pixel upwind (bilinear for smooth gradients)
+            float wxi=wx[i], wyi=wy[i];
+            float srcX = float(x) - wxi;
+            float srcY = float(y) - wyi;
+
+            int x0=int(std::floor(srcX)), y0=int(std::floor(srcY));
+            int x1=x0+1, y1=y0+1;
+            float fx=srcX-x0, fy=srcY-y0;
+            auto wrapX=[&](int v){return ((v%size)+size)%size;};
+            auto clampY=[&](int v){return std::clamp(v,0,size-1);};
+
+            float m00=moisture[clampY(y0)*size+wrapX(x0)];
+            float m10=moisture[clampY(y0)*size+wrapX(x1)];
+            float m01=moisture[clampY(y1)*size+wrapX(x0)];
+            float m11=moisture[clampY(y1)*size+wrapX(x1)];
+            float srcMoist=(m00*(1-fx)+m10*fx)*(1-fy)+(m01*(1-fx)+m11*fx)*fy;
+
+            // Bilinear elevation at source pixel
+            float e00=elevGrid[clampY(y0)*size+wrapX(x0)];
+            float e10=elevGrid[clampY(y0)*size+wrapX(x1)];
+            float e01=elevGrid[clampY(y1)*size+wrapX(x0)];
+            float e11=elevGrid[clampY(y1)*size+wrapX(x1)];
+            float elevSrc=(e00*(1-fx)+e10*fx)*(1-fy)+(e01*(1-fx)+e11*fx)*fy;
+
+            float elevDiff = elevGrid[i] - elevSrc;
+
+            // Orographic lift (upslope): air cools, moisture condenses → rain
+            // Föhn effect (downslope): air warms and dries out further
+            float moistureChange;
+            if(elevDiff > 0.f){
+                // Upslope: lose moisture proportional to ascent
+                float rainFraction = std::clamp(elevDiff * 1.2f, 0.f, 0.40f);
+                moistureChange = srcMoist * (1.f - rainFraction);
+            } else {
+                // Downslope (föhn): descending air warms and becomes drier
+                // than it would be from simple advection — amplify the drying
+                float dryBoost = std::clamp(-elevDiff * 0.6f, 0.f, 0.20f);
+                moistureChange = srcMoist * (1.f - dryBoost);
+            }
+
+            // Gentle background evaporation loss over land
+            moistureChange *= 0.988f;
+
+            // TWO-WAY BLEND: arriving air mass partially replaces current moisture.
+            // This is the key change — dry air CAN displace moist air.
+            // advectStrength controls how quickly the air mass turns over.
+            newMoisture[i] = moisture[i] * (1.f - advectStrength)
+                           + moistureChange * advectStrength;
+            newMoisture[i] = std::clamp(newMoisture[i], 0.f, 1.f);
+        }
+
+        moisture = std::move(newMoisture);
+
+        // Lateral diffusion every 4 passes: spreads moisture sideways,
+        // breaks up linear streaks, simulates turbulent mixing.
+        // More frequent diffusion = smoother, more uniform gradients.
+        if((pass+1)%4==0){
+            std::vector<float> sm = moisture;
+            for(int y=1;y<size-1;++y)
+            for(int x=0;x<size;++x){
+                int i=y*size+x;
+                if(elevGrid[i]<0.f) continue;
+                int xL=((x-1)+size)%size, xR=(x+1)%size;
+                // Stronger diffusion kernel: 40% self, 15% each cardinal neighbour
+                sm[i] = moisture[i]*0.40f
+                       + moisture[y*size+xL]*0.15f
+                       + moisture[y*size+xR]*0.15f
+                       + moisture[(y-1)*size+x]*0.15f
+                       + moisture[(y+1)*size+x]*0.15f;
+            }
+            moisture=std::move(sm);
+            // Re-enforce ocean boundary after diffusion
+            for(int i=0;i<size*size;++i)
+                if(elevGrid[i]<0.f) moisture[i]=1.f;
+        }
+    }
+
+    // ── 4d. Erosion ───────────────────────────────────────────────────────────
+    // Erode elevation proportional to moisture and local slope magnitude.
+    // High moisture + steep slope = strong erosion (rivers carve valleys).
+    // Apply to a copy so we don't feedback into the same pass.
+    std::vector<float> erodedElev = elevGrid;
+    for(int y=1;y<size-1;++y)
+    for(int x=1;x<size-1;++x){
+        int i=y*size+x;
+        if(elevGrid[i]<0.f) continue; // don't erode ocean floor
+
+        // Local slope magnitude (central differences)
+        float dzdx=(elevGrid[i+1]-elevGrid[i-1])*0.5f;
+        float dzdy=(elevGrid[(y+1)*size+x]-elevGrid[(y-1)*size+x])*0.5f;
+        float slope=std::sqrt(dzdx*dzdx+dzdy*dzdy);
+
+        float erosion = moisture[i] * slope * 0.35f;
+        erodedElev[i] = std::clamp(elevGrid[i]-erosion, -1.f, 1.f);
+    }
+
+    // ── 4e. Temperature field ─────────────────────────────────────────────────
+    // temp in [0,1]: 1=hot (equator), 0=freezing (poles / high altitude)
+    // Base: cosine of latitude (equator=1, poles=0)
+    // Altitude lapse: subtract ~0.65°C per 100m; we map elev [0,1] → ~0.5 temp drop
+    std::vector<float> tempGrid(size*size);
+    for(int y=0;y<size;++y){
+        float lat=PI*(0.5f-float(y)/float(size));   // [-PI/2, PI/2]
+        float basetemp=std::cos(lat);                // 1 at equator, 0 at poles
+        for(int x=0;x<size;++x){
+            int i=y*size+x;
+            float elev=erodedElev[i];
+            // Altitude lapse: land above sea level cools; ocean is moderated
+            float altCool = (elev > 0.f) ? elev * 0.55f : 0.f;
+            tempGrid[i]=std::clamp(basetemp - altCool, 0.f, 1.f);
+        }
+    }
+
+    // ── 4f. Biome colour from temperature × moisture (Whittaker diagram) ──────
+    // Returns RGBA for a land pixel given temp [0,1] and moisture [0,1].
+    // Biome matrix (approximate):
+    //
+    //          Cold(0-0.25)      Cool(0.25-0.5)    Warm(0.5-0.75)    Hot(0.75-1)
+    // Dry      Ice/tundra        Cold steppe        Hot steppe        Hot desert
+    // Moderate Tundra shrub      Boreal/taiga       Dry woodland      Savanna
+    // Wet      Boreal forest     Temp. forest       Subtrop. forest   Tropical RF
+    //
+    // We implement this as a smooth 2-D blend between corner biome colours.
+
+    auto biomeCol=[](float temp, float moist)->uint32_t{
+        // Corner biome colours (r,g,b):
+        // cold-dry, cold-wet, hot-dry, hot-wet
+        // We use a 2×2 bilinear blend across the temp/moisture space.
+
+        // Clamp inputs
+        temp  = std::clamp(temp,  0.f, 1.f);
+        moist = std::clamp(moist, 0.f, 1.f);
+
+        // Define a 4×4 grid of biome colours indexed by [temp_band][moist_band]
+        // temp bands:  0=freezing(<0.15), 1=cold(0.15-0.4), 2=warm(0.4-0.7), 3=hot(>0.7)
+        // moist bands: 0=arid(<0.15), 1=dry(0.15-0.4), 2=moist(0.4-0.7), 3=wet(>0.7)
+        // Softened palette: adjacent biomes share similar mid-tones so the
+        // bilinear blend produces smooth, natural-looking transitions rather
+        // than harsh colour jumps.
+        struct C{uint8_t r,g,b;};
+        static const C grid[4][4]={
+            // moist:  arid              dry               moist             wet
+            /* cold */ {{215,225,235},   {185,200,205},    {165,185,175},    {145,170,160}},  // ice/tundra
+            /* cool */ {{195,180,140},   {155,165,110},    {100,145, 90},    { 70,130, 80}},  // steppe/boreal
+            /* warm */ {{205,185,105},   {175,170, 85},    {110,150, 75},    { 60,120, 65}},  // desert/savanna/forest
+            /* hot  */ {{215,185, 95},   {185,165, 80},    {120,145, 65},    { 45,105, 55}},  // hot desert/tropical
+        };
+
+        // Map temp and moist to continuous grid coordinates
+        // temp: 0→0, 0.15→0.5, 0.4→1.5, 0.7→2.5, 1→3
+        auto tempToGrid=[](float t)->float{
+            if(t<0.15f) return t/0.15f*0.5f;
+            if(t<0.40f) return 0.5f+(t-0.15f)/0.25f;
+            if(t<0.70f) return 1.5f+(t-0.40f)/0.30f;
+            return 2.5f+(t-0.70f)/0.30f*0.5f;
+        };
+        auto moistToGrid=[](float m)->float{
+            if(m<0.15f) return m/0.15f*0.5f;
+            if(m<0.40f) return 0.5f+(m-0.15f)/0.25f;
+            if(m<0.70f) return 1.5f+(m-0.40f)/0.30f;
+            return 2.5f+(m-0.70f)/0.30f*0.5f;
+        };
+
+        float gx=std::clamp(tempToGrid(temp),  0.f, 3.f);
+        float gy=std::clamp(moistToGrid(moist), 0.f, 3.f);
+
+        int tx=std::min(int(gx),2), ty=std::min(int(gy),2);
+        float fx=gx-tx, fy=gy-ty;
+
+        // Bilinear interpolation over the 2×2 cell
+        auto lerp8=[](uint8_t a,uint8_t b,float t)->float{return a+t*(b-a);};
+        auto blendC=[&](int ti,int mi)->C{return grid[ti][mi];};
+
+        float r=lerp8(lerp8(blendC(tx,ty).r,  blendC(tx+1,ty).r,  fx),
+                      lerp8(blendC(tx,ty+1).r, blendC(tx+1,ty+1).r,fx), fy);
+        float g=lerp8(lerp8(blendC(tx,ty).g,  blendC(tx+1,ty).g,  fx),
+                      lerp8(blendC(tx,ty+1).g, blendC(tx+1,ty+1).g,fx), fy);
+        float b=lerp8(lerp8(blendC(tx,ty).b,  blendC(tx+1,ty).b,  fx),
+                      lerp8(blendC(tx,ty+1).b, blendC(tx+1,ty+1).b,fx), fy);
+
+        return rgba(uint8_t(std::clamp<int>(int(r),0,255)),
+                    uint8_t(std::clamp<int>(int(g),0,255)),
+                    uint8_t(std::clamp<int>(int(b),0,255)));
+    };
+
+    std::vector<uint32_t> pix4(size*size);
+    for(int y=0;y<size;++y)
+    for(int x=0;x<size;++x){
+        int i=y*size+x;
+        float e=erodedElev[i];
+        if(e<0.f){
+            pix4[i]=elevCol(e);  // ocean: use elevation blue palette
+        } else {
+            pix4[i]=biomeCol(tempGrid[i], moisture[i]);
+        }
+    }
+
+    // Wind arrow overlay — draw small arrows every arrowStep pixels
+    // Arrow: a short line from the pixel in the wind direction, plus a tiny head
+    {
+        int arrowStep = std::max(size/24, 6);
+        for(int ay=arrowStep/2; ay<size; ay+=arrowStep)
+        for(int ax=arrowStep/2; ax<size; ax+=arrowStep){
+            int ai=ay*size+ax;
+            float wxi=wx[ai], wyi=wy[ai];
+            int len=arrowStep/2;
+
+            // Shaft
+            for(int s2=0;s2<=len;++s2){
+                int px=ax+int(wxi*s2+0.5f);
+                int py=ay+int(wyi*s2+0.5f);
+                if(px<0||px>=size||py<0||py>=size) continue;
+                pix4[py*size+px]=rgba(255,255,255,200);
+            }
+            // Arrowhead (two short lines at ~45° to shaft)
+            int tx=ax+int(wxi*len+0.5f);
+            int ty=ay+int(wyi*len+0.5f);
+            // Perpendicular
+            float px2=-wyi, py2=wxi;
+            for(int s2=1;s2<=len/2;++s2){
+                auto plot=[&](int bx,int by){
+                    if(bx>=0&&bx<size&&by>=0&&by<size)
+                        pix4[by*size+bx]=rgba(255,255,255,200);
+                };
+                plot(tx+int((-wxi+px2)*s2*0.5f+0.5f), ty+int((-wyi+py2)*s2*0.5f+0.5f));
+                plot(tx+int((-wxi-px2)*s2*0.5f+0.5f), ty+int((-wyi-py2)*s2*0.5f+0.5f));
+            }
+        }
+    }
+
+    // Also update pix3 with eroded elevation so the Elevation layer reflects erosion
+    for(int i=0;i<size*size;++i)
+        pix3[i]=elevCol(erodedElev[i]);
+
     // ── Pack into snapshot ────────────────────────────────────────────────────
     snap.layerPixels[0]=std::move(pix0);
     snap.layerPixels[1]=std::move(pix1);
     snap.layerPixels[2]=std::move(pix2);
     snap.layerPixels[3]=std::move(pix3);
+    snap.layerPixels[4]=std::move(pix4);
     for(int L=0;L<int(MapLayer::Count);++L)
         snap.layerMercator[L]=toMercator(snap.layerPixels[L],size);
 

@@ -267,7 +267,10 @@ int main()
             ImGui::SetTooltip("Gradient terrain halos:\nMountain belts, rift valleys, transform fault scars.");
         ImGui::RadioButton("Elevation Heatmap", &activeLayer, int(MapLayer::Elevation));
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Topographic heatmap.\nNavy=deep ocean  Teal=coast  Green=lowland\nBrown=highland  White=peak");
+            ImGui::SetTooltip("Topographic heatmap (with erosion applied).\nNavy=deep ocean  Teal=coast  Green=lowland\nBrown=highland  White=peak");
+        ImGui::RadioButton("Climate / Wind",    &activeLayer, int(MapLayer::Climate));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Moisture & biome map with wind arrows.\nSandy=desert  Yellow-green=savanna  Green=temperate\nDark green=rainforest  Blue=ocean\nWhite arrows show prevailing wind direction.\nErosion from rainfall softens mountain peaks.");
 
         ImGui::Separator();
 

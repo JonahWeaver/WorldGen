@@ -14,7 +14,7 @@ struct GeneratorSettings
     float boundaryRoughness = 0.6f;
     float angularVelocity = 0.25f;  // slow drift so shapes stay recognisable across snapshots
     bool fragmentation = false;     // off by default; keeps plate count stable across timeline
-    int snapshotCount = 6;   // how many evenly-spaced snapshots to capture (including final)
+    int snapshotCount = 6;          // how many evenly-spaced snapshots to capture (including final)
 };
 
 // Render layers — each available as a globe texture and a Mercator texture.
@@ -24,7 +24,8 @@ enum class MapLayer
     BoundaryTypes    = 1,  // plate colours + coloured boundary lines (red/green/gold)
     CollisionEffects = 2,  // plate colours + halo terrain effects at boundaries
     Elevation        = 3,  // topographic heatmap (deep ocean -> coast -> highland -> peak)
-    Count            = 4
+    Climate          = 4,  // moisture/rainfall heatmap + wind direction arrows + erosion
+    Count            = 5
 };
 
 // One point-in-time snapshot of the world.
