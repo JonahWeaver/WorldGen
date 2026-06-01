@@ -14,24 +14,41 @@ struct GeneratorSettings
     float boundaryRoughness = 0.6f;
     float angularVelocity = 0.7f;
     bool fragmentation = true;
+    int snapshotCount = 6;   // how many evenly-spaced snapshots to capture (including final)
 };
 
-// Three render layers, each available as a globe texture and a Mercator texture.
+// Render layers — each available as a globe texture and a Mercator texture.
 enum class MapLayer
 {
-    TectonicPlates  = 0,  // solid plate colours, fractal edges, no boundary overlay
-    BoundaryTypes   = 1,  // plate colours + coloured boundary lines (red/green/gold)
-    CollisionEffects = 2, // plate colours + halo terrain effects at boundaries
-    Count           = 3
+    TectonicPlates   = 0,  // solid plate colours, fractal edges, no boundary overlay
+    BoundaryTypes    = 1,  // plate colours + coloured boundary lines (red/green/gold)
+    CollisionEffects = 2,  // plate colours + halo terrain effects at boundaries
+    Elevation        = 3,  // topographic heatmap (deep ocean -> coast -> highland -> peak)
+    Count            = 4
+};
+
+// One point-in-time snapshot of the world.
+struct MapSnapshot
+{
+    float simulationTime = 0.f;   // elapsed simulation seconds at this snapshot
+    int   plateCount     = 0;     // number of plates at this moment
+
+    // layerPixels[L] and layerMercator[L] for each MapLayer L
+    std::vector<uint32_t> layerPixels   [static_cast<int>(MapLayer::Count)];
+    std::vector<uint32_t> layerMercator [static_cast<int>(MapLayer::Count)];
 };
 
 struct MapResult
 {
     int size = 0;
 
-    // [0] = TectonicPlates, [1] = BoundaryTypes, [2] = CollisionEffects
-    std::vector<uint32_t> layerPixels   [static_cast<int>(MapLayer::Count)];
-    std::vector<uint32_t> layerMercator [static_cast<int>(MapLayer::Count)];
+    // Ordered snapshots from t=0 (or first interval) through final time.
+    // snapshots.back() is always the final map.
+    std::vector<MapSnapshot> snapshots;
+
+    // Convenience accessors into the final snapshot (back())
+    const std::vector<uint32_t>& layerPixels  (int L) const { return snapshots.back().layerPixels  [L]; }
+    const std::vector<uint32_t>& layerMercator(int L) const { return snapshots.back().layerMercator[L]; }
 
     int finalPlateCount = 0;
     int convergentCount = 0;

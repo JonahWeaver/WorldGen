@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
+#include <vector>
 
 static void glfw_error_callback(int error, const char* description)
 {
@@ -21,92 +23,119 @@ static void glfw_error_callback(int error, const char* description)
 
 static GLuint createTexture(int size, const void* data)
 {
-    GLuint texture = 0;
-    glGenTextures(1, &texture);
-    glBindTexture(GL_TEXTURE_2D, texture);
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-    return texture;
+    return tex;
 }
 
-static void updateTexture(GLuint texture, int size, const void* data)
+static void updateTexture(GLuint tex, int size, const void* data)
 {
-    glBindTexture(GL_TEXTURE_2D, texture);
+    glBindTexture(GL_TEXTURE_2D, tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
 }
 
 static void setPerspective(float fovY, float aspect, float zNear, float zFar)
 {
     float rad = fovY * 3.14159265358979323846f / 180.0f;
-    float tangent = tanf(rad / 2.0f);
-    float height = zNear * tangent;
-    float width = height * aspect;
-    glFrustum(-width, width, -height, height, zNear, zFar);
+    float tang = tanf(rad / 2.0f);
+    float h = zNear * tang, w = h * aspect;
+    glFrustum(-w, w, -h, h, zNear, zFar);
 }
 
-static void drawTexturedSphere(GLuint texture, float radius, int lonSegments, int latSegments, float yawDegrees, float pitchDegrees)
+static void drawTexturedSphere(GLuint tex, float radius, int lonSeg, int latSeg,
+                                float yaw, float pitch)
 {
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glColor3f(1.0f, 1.0f, 1.0f);
-
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glColor3f(1, 1, 1);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
-    glTranslatef(0.0f, 0.0f, -3.0f);
-    glRotatef(pitchDegrees, 1.0f, 0.0f, 0.0f);
-    glRotatef(yawDegrees, 0.0f, 1.0f, 0.0f);
+    glTranslatef(0, 0, -3);
+    glRotatef(pitch, 1, 0, 0);
+    glRotatef(yaw,   0, 1, 0);
 
     constexpr float PI = 3.14159265358979323846f;
-    for (int i = 0; i < latSegments; ++i)
+    for (int i = 0; i < latSeg; ++i)
     {
-        float lat0 = PI * (-0.5f + static_cast<float>(i) / latSegments);
-        float lat1 = PI * (-0.5f + static_cast<float>(i + 1) / latSegments);
+        float lat0 = PI * (-0.5f + float(i)   / latSeg);
+        float lat1 = PI * (-0.5f + float(i+1) / latSeg);
         float y0 = std::sin(lat0), y1 = std::sin(lat1);
         float r0 = std::cos(lat0), r1 = std::cos(lat1);
-
         glBegin(GL_QUAD_STRIP);
-        for (int j = 0; j <= lonSegments; ++j)
+        for (int j = 0; j <= lonSeg; ++j)
         {
-            float lon = 2.0f * PI * static_cast<float>(j) / lonSegments;
+            float lon = 2.f * PI * float(j) / lonSeg;
             float x = std::cos(lon), z = std::sin(lon);
-            float s = static_cast<float>(j) / lonSegments;
-            glTexCoord2f(s, static_cast<float>(i) / latSegments);
-            glVertex3f(radius * r0 * x, radius * y0, radius * r0 * z);
-            glTexCoord2f(s, static_cast<float>(i + 1) / latSegments);
-            glVertex3f(radius * r1 * x, radius * y1, radius * r1 * z);
+            float s = float(j) / lonSeg;
+            glTexCoord2f(s, float(i)   / latSeg); glVertex3f(radius*r0*x, radius*y0, radius*r0*z);
+            glTexCoord2f(s, float(i+1) / latSeg); glVertex3f(radius*r1*x, radius*y1, radius*r1*z);
         }
         glEnd();
     }
-
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_DEPTH_TEST);
 }
 
-static void drawFlatMap(GLuint texture, float aspect)
+static void drawFlatMap(GLuint tex, float aspect)
 {
     glDisable(GL_DEPTH_TEST);
     glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glColor3f(1.0f, 1.0f, 1.0f);
-
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glColor3f(1, 1, 1);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
-
-    float width = 1.6f;
-    float height = width / aspect;
+    float w = 1.6f, h = w / aspect;
     glBegin(GL_QUADS);
-    glTexCoord2f(0.0f, 1.0f); glVertex3f(-width, -height, -3.0f);
-    glTexCoord2f(1.0f, 1.0f); glVertex3f( width, -height, -3.0f);
-    glTexCoord2f(1.0f, 0.0f); glVertex3f( width,  height, -3.0f);
-    glTexCoord2f(0.0f, 0.0f); glVertex3f(-width,  height, -3.0f);
+    glTexCoord2f(0,1); glVertex3f(-w,-h,-3);
+    glTexCoord2f(1,1); glVertex3f( w,-h,-3);
+    glTexCoord2f(1,0); glVertex3f( w, h,-3);
+    glTexCoord2f(0,0); glVertex3f(-w, h,-3);
     glEnd();
-
     glDisable(GL_TEXTURE_2D);
+}
+
+// ── Per-snapshot GPU textures ─────────────────────────────────────────────────
+
+constexpr int LC = static_cast<int>(MapLayer::Count);
+
+struct SnapTextures
+{
+    GLuint globe   [LC] = {};
+    GLuint mercator[LC] = {};
+};
+
+static void uploadSnapshot(SnapTextures& st, const MapSnapshot& snap, int size)
+{
+    for (int L = 0; L < LC; ++L)
+    {
+        if (st.globe[L] == 0)
+        {
+            st.globe   [L] = createTexture(size, snap.layerPixels   [L].data());
+            st.mercator[L] = createTexture(size, snap.layerMercator [L].data());
+        }
+        else
+        {
+            updateTexture(st.globe   [L], size, snap.layerPixels   [L].data());
+            updateTexture(st.mercator[L], size, snap.layerMercator [L].data());
+        }
+    }
+}
+
+static void deleteSnapTextures(SnapTextures& st)
+{
+    for (int L = 0; L < LC; ++L)
+    {
+        if (st.globe   [L]) { glDeleteTextures(1, &st.globe   [L]); st.globe   [L]=0; }
+        if (st.mercator[L]) { glDeleteTextures(1, &st.mercator[L]); st.mercator[L]=0; }
+    }
 }
 
 int main()
@@ -123,7 +152,6 @@ int main()
 
     GLFWwindow* window = glfwCreateWindow(1280, 760, "WorldGen Fantasy Map", nullptr, nullptr);
     if (!window) { glfwTerminate(); return 1; }
-
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
@@ -136,53 +164,42 @@ int main()
     GeneratorSettings settings;
     MapResult map = generateMap(settings);
 
-    // One globe texture + one mercator texture per layer
-    constexpr int LayerCount = static_cast<int>(MapLayer::Count);
-    GLuint globeTextures   [LayerCount] = {};
-    GLuint mercatorTextures[LayerCount] = {};
-    for (int L = 0; L < LayerCount; ++L)
-    {
-        globeTextures   [L] = createTexture(map.size, map.layerPixels   [L].data());
-        mercatorTextures[L] = createTexture(map.size, map.layerMercator [L].data());
-    }
+    // Upload all snapshot textures
+    std::vector<SnapTextures> snapTextures(map.snapshots.size());
+    for (int s = 0; s < int(map.snapshots.size()); ++s)
+        uploadSnapshot(snapTextures[s], map.snapshots[s], map.size);
 
-    // Active layer (default = TectonicPlates)
-    int activeLayer = static_cast<int>(MapLayer::TectonicPlates);
+    int activeLayer    = static_cast<int>(MapLayer::TectonicPlates);
+    int activeSnapshot = int(map.snapshots.size()) - 1;  // default = final
 
     enum ViewMode { GlobeView = 0, Map2DView = 1 };
     ViewMode viewMode = GlobeView;
-    float globeYaw = 0.0f, globePitch = 15.0f;
+    float globeYaw = 0.f, globePitch = 15.f;
     bool mouseDragging = false;
-    double lastMouseX = 0.0, lastMouseY = 0.0;
+    double lastMouseX = 0, lastMouseY = 0;
     bool rotateGlobe = true;
-    float rotationSpeed = 18.0f;
+    float rotationSpeed = 18.f;
     double lastTime = glfwGetTime();
 
     while (!glfwWindowShouldClose(window))
     {
-        double currentTime = glfwGetTime();
-        float deltaTime = static_cast<float>(currentTime - lastTime);
-        lastTime = currentTime;
+        double now = glfwGetTime();
+        float dt = float(now - lastTime);
+        lastTime = now;
 
         ImGuiIO& io = ImGui::GetIO();
-        double mouseX = 0.0, mouseY = 0.0;
-        glfwGetCursorPos(window, &mouseX, &mouseY);
-        int leftDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT);
+        double mx = 0, my = 0;
+        glfwGetCursorPos(window, &mx, &my);
+        int lb = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT);
 
-        if (leftDown == GLFW_PRESS && !io.WantCaptureMouse && viewMode == GlobeView)
+        if (lb == GLFW_PRESS && !io.WantCaptureMouse && viewMode == GlobeView)
         {
-            if (!mouseDragging)
-            {
-                mouseDragging = true;
-                lastMouseX = mouseX; lastMouseY = mouseY;
-            }
+            if (!mouseDragging) { mouseDragging=true; lastMouseX=mx; lastMouseY=my; }
             else
             {
-                float dx = static_cast<float>(mouseX - lastMouseX);
-                float dy = static_cast<float>(mouseY - lastMouseY);
-                globeYaw   += dx * 0.4f;
-                globePitch  = std::clamp(globePitch + dy * 0.3f, -89.0f, 89.0f);
-                lastMouseX = mouseX; lastMouseY = mouseY;
+                globeYaw   += float(mx-lastMouseX)*0.4f;
+                globePitch  = std::clamp(globePitch+float(my-lastMouseY)*0.3f,-89.f,89.f);
+                lastMouseX=mx; lastMouseY=my;
             }
             rotateGlobe = false;
         }
@@ -190,7 +207,7 @@ int main()
         {
             mouseDragging = false;
             if (rotateGlobe && viewMode == GlobeView)
-                globeYaw = std::fmod(globeYaw + rotationSpeed * deltaTime, 360.0f);
+                globeYaw = std::fmod(globeYaw + rotationSpeed*dt, 360.f);
         }
 
         glfwPollEvents();
@@ -198,84 +215,127 @@ int main()
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        int displayW, displayH;
-        glfwGetFramebufferSize(window, &displayW, &displayH);
-        glViewport(0, 0, displayW, displayH);
-        glClearColor(0.10f, 0.11f, 0.13f, 1.00f);
+        int dw, dh;
+        glfwGetFramebufferSize(window, &dw, &dh);
+        glViewport(0, 0, dw, dh);
+        glClearColor(0.10f, 0.11f, 0.13f, 1.f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+        float aspect = (dw>0&&dh>0) ? float(dw)/float(dh) : 1.f;
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        float aspect = (displayW > 0 && displayH > 0)
-                     ? static_cast<float>(displayW) / static_cast<float>(displayH)
-                     : 1.0f;
+
+        // Clamp activeSnapshot in case map was just regenerated with fewer snapshots
+        activeSnapshot = std::clamp(activeSnapshot, 0, int(snapTextures.size())-1);
+        const SnapTextures& st = snapTextures[activeSnapshot];
 
         if (viewMode == GlobeView)
         {
-            setPerspective(45.0f, aspect, 0.1f, 10.0f);
-            drawTexturedSphere(globeTextures[activeLayer], 1.0f, 64, 32, globeYaw, globePitch);
+            setPerspective(45.f, aspect, 0.1f, 10.f);
+            drawTexturedSphere(st.globe[activeLayer], 1.f, 64, 32, globeYaw, globePitch);
         }
         else
         {
-            glMatrixMode(GL_PROJECTION);
-            glLoadIdentity();
-            glOrtho(-aspect, aspect, -1.0f, 1.0f, 0.1f, 10.0f);
-            drawFlatMap(mercatorTextures[activeLayer], aspect);
+            glOrtho(-aspect, aspect, -1.f, 1.f, 0.1f, 10.f);
+            drawFlatMap(st.mercator[activeLayer], aspect);
         }
 
         // ── UI panel ─────────────────────────────────────────────────────────
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(355, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_Always);
         ImGui::Begin("Map Controls", nullptr,
             ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
 
-        ImGui::TextWrapped("Generate tectonic plates and choose the main display mode.");
+        ImGui::TextWrapped("Generate tectonic plates and choose the display mode.");
 
-        // View mode (Globe / 2-D Map)
-        ImGui::RadioButton("Globe",  reinterpret_cast<int*>(&viewMode), GlobeView);
+        ImGui::RadioButton("Globe",   reinterpret_cast<int*>(&viewMode), GlobeView);
         ImGui::SameLine();
         ImGui::RadioButton("2-D Map", reinterpret_cast<int*>(&viewMode), Map2DView);
 
         ImGui::Separator();
 
-        // Layer selector
+        // ── Layer selector ────────────────────────────────────────────────────
         ImGui::Text("Map Layer:");
-        ImGui::RadioButton("Tectonic Plates",   &activeLayer, static_cast<int>(MapLayer::TectonicPlates));
+        ImGui::RadioButton("Tectonic Plates",   &activeLayer, int(MapLayer::TectonicPlates));
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Each plate shown in its own colour.\nFractal boundaries visible as colour transitions.");
-        ImGui::RadioButton("Boundary Types",    &activeLayer, static_cast<int>(MapLayer::BoundaryTypes));
+            ImGui::SetTooltip("Each plate in its own colour.\nFractal boundaries visible as colour transitions.");
+        ImGui::RadioButton("Boundary Types",    &activeLayer, int(MapLayer::BoundaryTypes));
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Plate colours + coloured fault lines:\nRed = Convergent  |  Green = Divergent  |  Gold = Transform");
-        ImGui::RadioButton("Collision Effects", &activeLayer, static_cast<int>(MapLayer::CollisionEffects));
+            ImGui::SetTooltip("Plate colours + coloured fault lines:\nRed=Convergent  Green=Divergent  Gold=Transform");
+        ImGui::RadioButton("Collision Effects", &activeLayer, int(MapLayer::CollisionEffects));
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Gradient terrain halos along boundaries:\nMountain belts, rift valleys, transform fault scars.");
+            ImGui::SetTooltip("Gradient terrain halos:\nMountain belts, rift valleys, transform fault scars.");
+        ImGui::RadioButton("Elevation Heatmap", &activeLayer, int(MapLayer::Elevation));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Topographic heatmap.\nNavy=deep ocean  Teal=coast  Green=lowland\nBrown=highland  White=peak");
 
         ImGui::Separator();
 
-        // Generation settings
+        // ── Snapshot timeline ─────────────────────────────────────────────────
+        {
+            int snapCount = int(map.snapshots.size());
+            ImGui::Text("Timeline  (%d snapshots):", snapCount);
+
+            // Slider — 0 = earliest, snapCount-1 = final
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::SliderInt("##snap", &activeSnapshot, 0, snapCount-1))
+                activeSnapshot = std::clamp(activeSnapshot, 0, snapCount-1);
+
+            // Label showing elapsed time and plate count for the active snapshot
+            const MapSnapshot& cur = map.snapshots[activeSnapshot];
+            bool isFinal = (activeSnapshot == snapCount-1);
+            ImGui::Text("  t = %.2f s   |   plates = %d%s",
+                        cur.simulationTime, cur.plateCount,
+                        isFinal ? "  [final]" : "");
+
+            // Quick-jump buttons: one per snapshot
+            ImGui::Text("Jump to:");
+            for (int s = 0; s < snapCount; ++s)
+            {
+                if (s > 0) ImGui::SameLine();
+                char lbl[16];
+                std::snprintf(lbl, sizeof(lbl), "%d", s+1);
+                bool active = (s == activeSnapshot);
+                if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f,0.6f,0.9f,1.f));
+                if (ImGui::SmallButton(lbl)) activeSnapshot = s;
+                if (active) ImGui::PopStyleColor();
+            }
+        }
+
+        ImGui::Separator();
+
+        // ── Generation settings ───────────────────────────────────────────────
         ImGui::SliderInt("Map Size",          &settings.mapSize,          128, 2048);
         ImGui::SliderInt("Plate Count",       &settings.plateCount,         2,   64);
         ImGui::SliderInt("Fault Thickness",   &settings.faultIntensity,     1,    6);
-        ImGui::SliderFloat("Sim Time",        &settings.simulationTime,   0.0f, 120.0f, "%.1f s");
-        ImGui::SliderInt("Sim Steps",         &settings.simulationSteps,    1,   16);
-        ImGui::SliderFloat("Boundary Roughness", &settings.boundaryRoughness, 0.0f, 1.0f, "%.2f");
-        ImGui::SliderFloat("Angular Velocity",   &settings.angularVelocity,  0.1f, 3.0f, "%.2f");
+        ImGui::SliderFloat("Sim Time",        &settings.simulationTime,   0.f, 120.f, "%.1f s");
+        ImGui::SliderInt("Sim Steps",         &settings.simulationSteps,    1,   32);
+        ImGui::SliderInt("Snapshots",         &settings.snapshotCount,      1,   20);
+        ImGui::SliderFloat("Boundary Roughness", &settings.boundaryRoughness, 0.f, 1.f, "%.2f");
+        ImGui::SliderFloat("Angular Velocity",   &settings.angularVelocity,  0.1f, 3.f, "%.2f");
         ImGui::Checkbox("Plate Fragmentation", &settings.fragmentation);
         ImGui::InputScalar("Seed", ImGuiDataType_U32, &settings.seed);
 
         if (ImGui::Button("Generate", ImVec2(-1, 0)))
         {
             map = generateMap(settings);
-            for (int L = 0; L < LayerCount; ++L)
-            {
-                updateTexture(globeTextures   [L], map.size, map.layerPixels   [L].data());
-                updateTexture(mercatorTextures [L], map.size, map.layerMercator [L].data());
-            }
+
+            // Delete old textures
+            for (auto& st2 : snapTextures) deleteSnapTextures(st2);
+            snapTextures.clear();
+
+            // Upload new ones
+            snapTextures.resize(map.snapshots.size());
+            for (int s = 0; s < int(map.snapshots.size()); ++s)
+                uploadSnapshot(snapTextures[s], map.snapshots[s], map.size);
+
+            // Jump to final snapshot
+            activeSnapshot = int(map.snapshots.size()) - 1;
         }
 
         ImGui::Separator();
         ImGui::Checkbox("Auto Rotate", &rotateGlobe);
-        ImGui::SliderFloat("Rotation Speed", &rotationSpeed, 0.0f, 90.0f, "%.1f deg/s");
+        ImGui::SliderFloat("Rotation Speed", &rotationSpeed, 0.f, 90.f, "%.1f deg/s");
 
         ImGui::Separator();
         ImGui::Text("Requested plates : %d", settings.plateCount);
@@ -293,11 +353,7 @@ int main()
         glfwSwapBuffers(window);
     }
 
-    for (int L = 0; L < LayerCount; ++L)
-    {
-        glDeleteTextures(1, &globeTextures   [L]);
-        glDeleteTextures(1, &mercatorTextures[L]);
-    }
+    for (auto& st2 : snapTextures) deleteSnapTextures(st2);
     ImGui_ImplOpenGL2_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
