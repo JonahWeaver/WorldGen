@@ -997,6 +997,10 @@ MapSnapshot renderSnapshot(
     snap.layerPixels[3]=std::move(pix3);
     snap.layerPixels[4]=std::move(pix4);
     snap.layerPixels[5]=std::move(pix5);
+    // Layer 6 (Civilization) is filled in later by the civ simulation pass.
+    // Pre-size it so the array slot exists.
+    snap.layerPixels[6].assign(size*size, 0u);
+    snap.layerMercator[6].assign(size*size, 0u);
     for(int L=0;L<int(MapLayer::Count);++L)
         snap.layerMercator[L]=toMercator(snap.layerPixels[L],size);
 
@@ -1142,6 +1146,361 @@ MapResult generateMap(const GeneratorSettings& settings)
         result.convergentCount = conv;
         result.transformCount  = trans;
         result.divergentCount  = div;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 2: CIVILIZATION SIMULATION
+    // ══════════════════════════════════════════════════════════════════════════
+    // Derive per-cell scores from the final geology snapshot's climate/hydrology
+    // data, then simulate population growth, settlement spread, and culture.
+    // ══════════════════════════════════════════════════════════════════════════
+    {
+        const MapSnapshot& finalSnap = result.snapshots.back();
+        int civSteps    = std::max(settings.civSteps, 1);
+        int civSnapCount= std::clamp(settings.civSnapshots, 1, 20);
+        float growthRate= std::clamp(settings.growthRate, 0.001f, 1.f);
+        float spreadThr = std::clamp(settings.spreadThresh, 0.f, 1.f);
+
+        // ── Extract float data from the final snapshot's pixel layers ─────────
+        // We re-derive elevation, moisture, temperature, and flow from the
+        // rendered pixel colours. This avoids storing raw float grids in MapResult.
+        // Alternatively we read from the RGBA pixels we already computed.
+        // For simplicity we recompute the scores analytically from the biome
+        // colour layer (pix4 = climate) and elevation layer (pix3).
+
+        // Helper: extract normalised luminance from an RGBA pixel
+        auto lum=[](uint32_t p)->float{
+            float r=(p&0xFF)/255.f, g=((p>>8)&0xFF)/255.f, b=((p>>16)&0xFF)/255.f;
+            return 0.299f*r+0.587f*g+0.114f*b;
+        };
+
+        // ── Per-cell scores ───────────────────────────────────────────────────
+        result.civCells.resize(size*size);
+
+        for(int y=0;y<size;++y)
+        for(int x=0;x<size;++x){
+            int i=y*size+x;
+            CivCell& c=result.civCells[i];
+
+            // Elevation pixel: dark=ocean, mid=lowland, bright=mountain
+            uint32_t ep=finalSnap.layerPixels[3][i];
+            float er=(ep&0xFF)/255.f, eg=((ep>>8)&0xFF)/255.f, eb=((ep>>16)&0xFF)/255.f;
+            // Ocean detection: blue dominant and dark
+            bool isOcean=(eb>er+0.05f && eb>eg+0.05f && lum(ep)<0.35f);
+            if(isOcean){ c.habitability=0.f; c.fertility=0.f; c.traversability=0.f; continue; }
+
+            float elevLum=lum(ep); // 0=deep ocean, ~0.3=coast, ~0.6=highland, ~0.9=peak
+
+            // Climate pixel: green=fertile, sandy=arid, white=cold
+            uint32_t cp=finalSnap.layerPixels[4][i];
+            float cr=(cp&0xFF)/255.f, cg=((cp>>8)&0xFF)/255.f, cb2=((cp>>16)&0xFF)/255.f;
+            // Greenness = vegetation proxy
+            float greenness=std::clamp(cg-(cr+cb2)*0.5f, 0.f, 1.f)*2.f;
+            // Warmth: red/yellow tones = warm
+            float warmth=std::clamp((cr+cg*0.5f-cb2)*0.8f, 0.f, 1.f);
+            // Coldness: blue/white tones = cold/polar
+            float coldness=std::clamp(cb2-(cr+cg)*0.3f, 0.f, 1.f);
+
+            // Hydrology pixel: blue=river/lake, green-tinted=riparian
+            uint32_t hp=finalSnap.layerPixels[5][i];
+            float hr=(hp&0xFF)/255.f, hg=((hp>>8)&0xFF)/255.f, hb=((hp>>16)&0xFF)/255.f;
+            float riverProx=std::clamp(hb-(hr+hg)*0.4f, 0.f, 1.f); // blue = near water
+
+            // ── Habitability ─────────────────────────────────────────────────
+            // Best: temperate, low-mid elevation, near water, not too cold/hot
+            float elevPenalty=std::clamp((elevLum-0.55f)*3.f, 0.f, 1.f); // mountains bad
+            float tempScore=std::clamp(warmth*0.6f+greenness*0.4f-coldness*0.8f, 0.f, 1.f);
+            float waterBonus=riverProx*0.3f;
+            c.habitability=std::clamp(tempScore*(1.f-elevPenalty*0.7f)+waterBonus, 0.f, 1.f);
+
+            // ── Fertility ─────────────────────────────────────────────────────
+            // Flat, moist, warm land with river access
+            float flatness=std::clamp(1.f-elevLum*1.5f, 0.f, 1.f);
+            c.fertility=std::clamp(greenness*0.5f+flatness*0.3f+riverProx*0.2f, 0.f, 1.f);
+
+            // ── Traversability ────────────────────────────────────────────────
+            // Flat land and rivers are easy; mountains and dense forest are hard
+            float forestPenalty=std::clamp(greenness-0.5f, 0.f, 1.f)*0.4f;
+            c.traversability=std::clamp(flatness*0.7f+riverProx*0.2f-forestPenalty, 0.f, 1.f);
+        }
+
+        // ── Seed initial settlements ──────────────────────────────────────────
+        {
+            int numSeeds=std::max(2, plateCount*2);
+            int minDist=size/6;
+            std::vector<int> seeds;
+            std::vector<int> idx(size*size);
+            for(int i=0;i<size*size;++i) idx[i]=i;
+            std::sort(idx.begin(),idx.end(),[&](int a,int b){
+                return result.civCells[a].habitability>result.civCells[b].habitability;});
+            for(int ci:idx){
+                if(result.civCells[ci].habitability<spreadThr) break;
+                bool ok=true;
+                int cy=ci/size, cx=ci%size;
+                for(int s:seeds){
+                    int sy=s/size, sx=s%size;
+                    int dx2=std::abs(cx-sx), dy2=std::abs(cy-sy);
+                    if(dx2*dx2+dy2*dy2<minDist*minDist){ok=false;break;}
+                }
+                if(ok){
+                    int id=int(seeds.size());
+                    seeds.push_back(ci);
+                    result.civCells[ci].population=1.f;
+                    result.civCells[ci].settled=true;
+                    result.civCells[ci].cultureId=id;
+                    result.civCells[ci].countryId=id;
+                    result.civCells[ci].culture=0.1f;
+                    result.civCells[ci].cohesion=1.f;
+                    if(int(seeds.size())>=numSeeds) break;
+                }
+            }
+        }
+
+        // ── Palettes ─────────────────────────────────────────────────────────
+        // We allow up to 256 countries (breakaways create new IDs).
+        // Culture palette: distinct hues per culture group.
+        // Country palette: derived from culture hue but with varied lightness.
+        const int maxCultures=plateCount*2+4;
+        const int maxCountries=256;
+        std::vector<uint32_t> cultPalette, countryPalette;
+        cultPalette.reserve(maxCultures);
+        countryPalette.reserve(maxCountries);
+        for(int i=0;i<maxCultures;++i)
+            cultPalette.push_back(hsvToRgba(360.f*i/maxCultures, 0.75f, 0.90f));
+        // Country colours: same hue as culture but slightly varied saturation/value
+        // so countries within the same culture look related but distinct.
+        for(int i=0;i<maxCountries;++i){
+            float hue=360.f*(i%maxCultures)/maxCultures;
+            float sat=0.55f+0.30f*((i/maxCultures)%3)/2.f;
+            float val=0.70f+0.20f*((i/maxCultures+1)%3)/2.f;
+            countryPalette.push_back(hsvToRgba(hue,sat,val));
+        }
+
+        // nextCountryId: incremented each time a new country is born
+        int nextCountryId=maxCultures; // first maxCultures IDs reserved for seed countries
+
+        // ── Snapshot timing ───────────────────────────────────────────────────
+        std::vector<int> civSnapTicks;
+        for(int k=1;k<=civSnapCount;++k)
+            civSnapTicks.push_back(civSteps*k/civSnapCount);
+
+        // ── Simulation loop ───────────────────────────────────────────────────
+        const int ndx4[4]={1,-1,0,0};
+        const int ndy4[4]={0,0,1,-1};
+
+        for(int tick=1;tick<=civSteps;++tick){
+
+            // ── 1. Population growth ──────────────────────────────────────────
+            for(int i=0;i<size*size;++i){
+                CivCell& c=result.civCells[i];
+                if(!c.settled) continue;
+                float cap=c.fertility*10.f+1.f;
+                c.population+=c.population*growthRate*c.fertility*(1.f-c.population/cap);
+                c.population=std::clamp(c.population,0.f,cap);
+            }
+
+            // ── 2. Settlement spread ──────────────────────────────────────────
+            std::vector<std::pair<int,int>> newSettled; // (cell, sourceCell)
+            for(int y=1;y<size-1;++y)
+            for(int x=0;x<size;++x){
+                int i=y*size+x;
+                CivCell& c=result.civCells[i];
+                if(!c.settled||c.population<0.5f) continue;
+                for(int d=0;d<4;++d){
+                    int nx2=((x+ndx4[d])%size+size)%size;
+                    int ny2=std::clamp(y+ndy4[d],0,size-1);
+                    int ni=ny2*size+nx2;
+                    CivCell& nc=result.civCells[ni];
+                    if(nc.settled||nc.habitability<spreadThr) continue;
+                    float prob=c.traversability*0.15f*(c.population/5.f);
+                    if(prob>0.5f) newSettled.push_back({ni,i});
+                }
+            }
+            for(auto& [ni,si]:newSettled){
+                CivCell& nc=result.civCells[ni];
+                CivCell& sc=result.civCells[si];
+                if(!nc.settled){
+                    nc.settled=true;
+                    nc.population=0.1f;
+                    nc.culture=0.05f;
+                    nc.cohesion=0.8f;
+                    nc.cultureId=sc.cultureId;
+                    nc.countryId=sc.countryId;
+                }
+            }
+
+            // ── 3. Country expansion (conquest) ──────────────────────────────
+            // A country can absorb a neighbouring cell of a different country
+            // if it has much higher population pressure and the target has low cohesion.
+            if(tick%5==0){ // every 5 ticks to avoid too-rapid expansion
+                std::vector<std::pair<int,int>> conquests; // (cell, conquerorCell)
+                for(int y=1;y<size-1;++y)
+                for(int x=0;x<size;++x){
+                    int i=y*size+x;
+                    CivCell& c=result.civCells[i];
+                    if(!c.settled||c.countryId<0) continue;
+                    for(int d=0;d<4;++d){
+                        int nx2=((x+ndx4[d])%size+size)%size;
+                        int ny2=std::clamp(y+ndy4[d],0,size-1);
+                        int ni=ny2*size+nx2;
+                        CivCell& nc=result.civCells[ni];
+                        if(!nc.settled||nc.countryId==c.countryId) continue;
+                        // Conquest: attacker pop >> defender pop AND low cohesion
+                        float attackStr=c.population*c.culture*c.traversability;
+                        float defendStr=nc.population*nc.cohesion;
+                        if(attackStr>defendStr*2.5f)
+                            conquests.push_back({ni,i});
+                    }
+                }
+                for(auto& [ni,ci2]:conquests){
+                    CivCell& nc=result.civCells[ni];
+                    CivCell& cc2=result.civCells[ci2];
+                    nc.countryId=cc2.countryId;
+                    // Culture slowly shifts toward conqueror's culture
+                    if(nc.cultureId!=cc2.cultureId)
+                        nc.culture=std::max(0.f,nc.culture-0.1f);
+                    nc.cohesion=0.3f; // newly conquered = low cohesion
+                }
+            }
+
+            // ── 4. Culture & cohesion update ──────────────────────────────────
+            for(int y=1;y<size-1;++y)
+            for(int x=0;x<size;++x){
+                int i=y*size+x;
+                CivCell& c=result.civCells[i];
+                if(!c.settled) continue;
+
+                int sameCountry=0, sameCulture=0;
+                float tradeFlow=0.f;
+                for(int d=0;d<4;++d){
+                    int nx2=((x+ndx4[d])%size+size)%size;
+                    int ny2=std::clamp(y+ndy4[d],0,size-1);
+                    int ni=ny2*size+nx2;
+                    CivCell& nc=result.civCells[ni];
+                    if(!nc.settled) continue;
+                    tradeFlow+=nc.traversability*nc.population*0.01f;
+                    if(nc.countryId==c.countryId) sameCountry++;
+                    if(nc.cultureId==c.cultureId) sameCulture++;
+                }
+
+                // Culture grows with same-culture neighbours and trade
+                float cultGrowth=0.004f*(sameCulture+1)+tradeFlow*0.002f;
+                c.culture=std::clamp(c.culture+cultGrowth,0.f,1.f);
+
+                // Cohesion: grows when surrounded by same-country neighbours,
+                // decays when isolated or surrounded by foreign cells.
+                // Also decays with distance from any same-country neighbour.
+                float cohTarget=(sameCountry>=3)?1.f:(sameCountry>=1)?0.6f:0.2f;
+                // Traversability penalty: hard terrain = harder to hold
+                cohTarget*=(0.5f+c.traversability*0.5f);
+                c.cohesion+=(cohTarget-c.cohesion)*0.04f;
+                c.cohesion=std::clamp(c.cohesion,0.f,1.f);
+            }
+
+            // ── 5. Breakaway: low-cohesion regions split off ──────────────────
+            // Every 10 ticks, scan for cells with very low cohesion that are
+            // not adjacent to any same-country cell — they become independent.
+            if(tick%10==0 && nextCountryId<maxCountries-1){
+                for(int y=1;y<size-1;++y)
+                for(int x=0;x<size;++x){
+                    int i=y*size+x;
+                    CivCell& c=result.civCells[i];
+                    if(!c.settled||c.countryId<0||c.cohesion>0.25f) continue;
+                    // Check if any neighbour shares the same country
+                    bool hasSupport=false;
+                    for(int d=0;d<4;++d){
+                        int nx2=((x+ndx4[d])%size+size)%size;
+                        int ny2=std::clamp(y+ndy4[d],0,size-1);
+                        int ni=ny2*size+nx2;
+                        if(result.civCells[ni].countryId==c.countryId&&
+                           result.civCells[ni].cohesion>0.4f){hasSupport=true;break;}
+                    }
+                    if(!hasSupport){
+                        // Break away: form a new country with the same culture
+                        c.countryId=nextCountryId++;
+                        c.cohesion=0.5f; // fresh start
+                        if(nextCountryId>=maxCountries) break;
+                    }
+                }
+            }
+
+            // ── 6. Snapshot capture ───────────────────────────────────────────
+            for(int k=0;k<int(civSnapTicks.size());++k){
+                if(tick!=civSnapTicks[k]) continue;
+
+                CivSnapshot snap2;
+                snap2.tick=tick;
+                snap2.pixels.resize(size*size);
+
+                // Stats
+                float totPop=0.f; int settledN=0;
+                std::vector<bool> cultSeen(maxCultures,false);
+                std::vector<bool> countrySeen(maxCountries,false);
+                for(int i=0;i<size*size;++i){
+                    CivCell& c=result.civCells[i];
+                    if(c.settled){settledN++;totPop+=c.population;}
+                    if(c.cultureId>=0&&c.cultureId<maxCultures) cultSeen[c.cultureId]=true;
+                    if(c.countryId>=0&&c.countryId<maxCountries) countrySeen[c.countryId]=true;
+                }
+                snap2.totalPop=totPop;
+                snap2.settledCells=settledN;
+                snap2.cultureGroups=int(std::count(cultSeen.begin(),cultSeen.end(),true));
+
+                // Render: country colour fill + culture tint + borders + city dots
+                for(int y2=0;y2<size;++y2)
+                for(int x2=0;x2<size;++x2){
+                    int i=y2*size+x2;
+                    CivCell& c=result.civCells[i];
+                    uint32_t base=finalSnap.layerPixels[4][i]; // climate biome
+
+                    if(!c.settled){
+                        // Unsettled: dim biome
+                        uint8_t br=uint8_t((base&0xFF)*0.55f);
+                        uint8_t bg=uint8_t(((base>>8)&0xFF)*0.55f);
+                        uint8_t bb=uint8_t(((base>>16)&0xFF)*0.55f);
+                        snap2.pixels[i]=rgba(br,bg,bb);
+                    } else {
+                        // Country colour as primary fill
+                        int cid=std::clamp(c.countryId,0,maxCountries-1);
+                        uint32_t cc2=countryPalette[cid];
+
+                        // Blend: 60% country colour, 25% biome, 15% culture tint
+                        int cultId=std::clamp(c.cultureId,0,maxCultures-1);
+                        uint32_t cultCol=cultPalette[cultId];
+                        float cStr=std::clamp(c.culture*0.15f,0.f,0.15f);
+
+                        auto blend3=[&](int shift)->uint8_t{
+                            float bv=(base>>shift&0xFF)/255.f;
+                            float cv=(cc2>>shift&0xFF)/255.f;
+                            float kv=(cultCol>>shift&0xFF)/255.f;
+                            return uint8_t(std::clamp<int>(int((bv*0.25f+cv*0.60f+kv*cStr)*255),0,255));
+                        };
+                        uint8_t br=blend3(0), bg=blend3(8), bb=blend3(16);
+
+                        // Country border: darken pixels adjacent to a different country
+                        bool isBorder=false;
+                        for(int d=0;d<4;++d){
+                            int nx2=((x2+ndx4[d])%size+size)%size;
+                            int ny2=std::clamp(y2+ndy4[d],0,size-1);
+                            int ni=ny2*size+nx2;
+                            if(result.civCells[ni].countryId!=c.countryId){isBorder=true;break;}
+                        }
+                        if(isBorder){br=uint8_t(br*0.35f);bg=uint8_t(bg*0.35f);bb=uint8_t(bb*0.35f);}
+
+                        snap2.pixels[i]=rgba(br,bg,bb);
+
+                        // City dots: high-pop cells
+                        if(c.population>3.f){
+                            float t=std::clamp((c.population-3.f)/7.f,0.f,1.f);
+                            snap2.pixels[i]=rgba(uint8_t(220+t*35),uint8_t(210+t*45),uint8_t(80+t*60));
+                        }
+                    }
+                }
+
+                snap2.mercator=toMercator(snap2.pixels,size);
+                result.civSnaps.push_back(std::move(snap2));
+            }
+        }
     }
 
     return result;

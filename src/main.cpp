@@ -182,6 +182,27 @@ int main()
     double lastTime = glfwGetTime();
     bool showPanel = true;   // H key or button toggles the panel
 
+    // ── Civilization timeline textures ────────────────────────────────────────
+    // Each CivSnapshot gets two textures (globe + mercator).
+    struct CivTex { GLuint globe=0, mercator=0; };
+    std::vector<CivTex> civTextures;
+    auto uploadCivSnaps = [&](){
+        for(auto& ct : civTextures){
+            if(ct.globe)    glDeleteTextures(1,&ct.globe);
+            if(ct.mercator) glDeleteTextures(1,&ct.mercator);
+        }
+        civTextures.clear();
+        civTextures.resize(map.civSnaps.size());
+        for(int s=0;s<int(map.civSnaps.size());++s){
+            civTextures[s].globe    = createTexture(map.size, map.civSnaps[s].pixels.data());
+            civTextures[s].mercator = createTexture(map.size, map.civSnaps[s].mercator.data());
+        }
+    };
+    uploadCivSnaps();
+
+    bool showCivLayer   = false;  // toggle between geology layers and civ view
+    int  activeCivSnap  = int(map.civSnaps.size())-1;
+
     while (!glfwWindowShouldClose(window))
     {
         double now = glfwGetTime();
@@ -226,19 +247,36 @@ int main()
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
 
-        // Clamp activeSnapshot in case map was just regenerated with fewer snapshots
+        // Clamp indices
         activeSnapshot = std::clamp(activeSnapshot, 0, int(snapTextures.size())-1);
-        const SnapTextures& st = snapTextures[activeSnapshot];
+        {
+            int civMax = civTextures.empty() ? 0 : int(civTextures.size())-1;
+            activeCivSnap = std::clamp(activeCivSnap, 0, civMax);
+        }
+
+        // Choose which texture to display
+        GLuint displayGlobe = 0, displayMerc = 0;
+        if (showCivLayer && !civTextures.empty())
+        {
+            displayGlobe = civTextures[activeCivSnap].globe;
+            displayMerc  = civTextures[activeCivSnap].mercator;
+        }
+        else
+        {
+            const SnapTextures& st = snapTextures[activeSnapshot];
+            displayGlobe = st.globe[activeLayer];
+            displayMerc  = st.mercator[activeLayer];
+        }
 
         if (viewMode == GlobeView)
         {
             setPerspective(45.f, aspect, 0.1f, 10.f);
-            drawTexturedSphere(st.globe[activeLayer], 1.f, 64, 32, globeYaw, globePitch);
+            drawTexturedSphere(displayGlobe, 1.f, 64, 32, globeYaw, globePitch);
         }
         else
         {
             glOrtho(-aspect, aspect, -1.f, 1.f, 0.1f, 10.f);
-            drawFlatMap(st.mercator[activeLayer], aspect);
+            drawFlatMap(displayMerc, aspect);
         }
 
         // ── H key toggles panel visibility ───────────────────────────────────
@@ -330,6 +368,42 @@ int main()
 
         ImGui::Separator();
 
+        // ── Civilization layer ────────────────────────────────────────────────
+        ImGui::Checkbox("Show Civilization Layer", &showCivLayer);
+        if (showCivLayer && !civTextures.empty())
+        {
+            int civCount = int(map.civSnaps.size());
+            ImGui::Text("Civ Timeline  (%d snapshots):", civCount);
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::SliderInt("##civsnap", &activeCivSnap, 0, civCount-1))
+            {
+                int civMax = civCount-1;
+                activeCivSnap = std::clamp(activeCivSnap, 0, civMax);
+            }
+            const CivSnapshot& cs = map.civSnaps[activeCivSnap];
+            ImGui::Text("  Tick %d  |  Pop %.0f  |  Settled %d  |  Cultures %d",
+                        cs.tick, cs.totalPop, cs.settledCells, cs.cultureGroups);
+
+            // Quick-jump buttons
+            ImGui::Text("Jump to:");
+            for (int s = 0; s < civCount; ++s)
+            {
+                if (s > 0) ImGui::SameLine();
+                char lbl[16];
+                std::snprintf(lbl, sizeof(lbl), "%d", s+1);
+                bool active = (s == activeCivSnap);
+                if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f,0.5f,0.1f,1.f));
+                if (ImGui::SmallButton(lbl)) activeCivSnap = s;
+                if (active) ImGui::PopStyleColor();
+            }
+        }
+        else if (showCivLayer && civTextures.empty())
+        {
+            ImGui::TextColored(ImVec4(1,0.5f,0.2f,1), "No civilization data — click Generate.");
+        }
+
+        ImGui::Separator();
+
         // ── Generation settings ───────────────────────────────────────────────
         ImGui::SliderInt("Map Size",          &settings.mapSize,          128, 2048);
         ImGui::SliderInt("Plate Count",       &settings.plateCount,         2,   64);
@@ -342,21 +416,29 @@ int main()
         ImGui::Checkbox("Plate Fragmentation", &settings.fragmentation);
         ImGui::InputScalar("Seed", ImGuiDataType_U32, &settings.seed);
 
+        if (ImGui::CollapsingHeader("Civilization Settings"))
+        {
+            ImGui::SliderInt("Civ Steps",        &settings.civSteps,      10, 10000);
+            ImGui::SliderInt("Civ Snapshots",    &settings.civSnapshots,   1,   20);
+            ImGui::SliderFloat("Growth Rate",    &settings.growthRate,  0.001f, 0.5f, "%.3f");
+            ImGui::SliderFloat("Spread Thresh",  &settings.spreadThresh, 0.f,   1.f, "%.2f");
+        }
+
         if (ImGui::Button("Generate", ImVec2(-1, 0)))
         {
             map = generateMap(settings);
 
-            // Delete old textures
+            // Delete old geology textures
             for (auto& st2 : snapTextures) deleteSnapTextures(st2);
             snapTextures.clear();
-
-            // Upload new ones
             snapTextures.resize(map.snapshots.size());
             for (int s = 0; s < int(map.snapshots.size()); ++s)
                 uploadSnapshot(snapTextures[s], map.snapshots[s], map.size);
-
-            // Jump to final snapshot
             activeSnapshot = int(map.snapshots.size()) - 1;
+
+            // Upload new civilization textures
+            uploadCivSnaps();
+            activeCivSnap = int(map.civSnaps.size())-1;
         }
 
         ImGui::Separator();
@@ -381,6 +463,10 @@ int main()
     }
 
     for (auto& st2 : snapTextures) deleteSnapTextures(st2);
+    for (auto& ct : civTextures){
+        if(ct.globe)    glDeleteTextures(1,&ct.globe);
+        if(ct.mercator) glDeleteTextures(1,&ct.mercator);
+    }
     ImGui_ImplOpenGL2_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
