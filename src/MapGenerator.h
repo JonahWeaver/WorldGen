@@ -12,8 +12,8 @@ struct GeneratorSettings
     float simulationTime = 2.0f;
     int simulationSteps = 8;
     float boundaryRoughness = 0.6f;
-    float angularVelocity = 0.7f;
-    bool fragmentation = true;
+    float angularVelocity = 0.25f;  // slow drift so shapes stay recognisable across snapshots
+    bool fragmentation = false;     // off by default; keeps plate count stable across timeline
     int snapshotCount = 6;   // how many evenly-spaced snapshots to capture (including final)
 };
 

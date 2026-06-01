@@ -165,7 +165,8 @@ MapSnapshot renderSnapshot(
     int size,
     int thickness,
     float roughness,
-    unsigned int seed)
+    unsigned int seed,
+    int paletteSize)   // fixed palette size so colours are stable across all snapshots
 {
     MapSnapshot snap;
     snap.simulationTime = elapsedTime;
@@ -208,7 +209,9 @@ MapSnapshot renderSnapshot(
         return 1;
     };
 
-    auto palette=buildPalette(int(plates.size()));
+    // Use the fixed palette size so plate N always maps to the same colour
+    // regardless of how many plates exist at this snapshot.
+    auto palette=buildPalette(paletteSize);
 
     auto intCol=[&](int x,int y,int pl)->uint32_t{
         uint32_t c=palette[pl];
@@ -438,6 +441,11 @@ MapResult generateMap(const GeneratorSettings& settings)
         return cat;
     };
 
+    // The palette size is fixed to the maximum possible plate count so that
+    // plate N always maps to the same colour across every snapshot.
+    // If fragmentation is on, plates can grow up to 64; otherwise it stays at plateCount.
+    int paletteSize = settings.fragmentation ? 64 : plateCount;
+
     for(int step=0; step<totalSteps; ++step)
     {
         // Advance plates
@@ -464,7 +472,6 @@ MapResult generateMap(const GeneratorSettings& settings)
         // Check if we've passed the next snapshot time
         while(nextSnap < snapCount && elapsed >= snapTimes[nextSnap] - 1e-5f)
         {
-            // Build PlateState list with current motion categories
             auto cats = classifyPlates();
             std::vector<PlateState> ps;
             ps.reserve(plates.size());
@@ -473,7 +480,7 @@ MapResult generateMap(const GeneratorSettings& settings)
                                plates[i].angularVelocity, cats[i]});
 
             result.snapshots.push_back(
-                renderSnapshot(ps, elapsed, size, thickness, roughness, settings.seed));
+                renderSnapshot(ps, elapsed, size, thickness, roughness, settings.seed, paletteSize));
             ++nextSnap;
         }
     }
@@ -486,7 +493,8 @@ MapResult generateMap(const GeneratorSettings& settings)
         ps.reserve(plates.size());
         for(size_t i=0;i<plates.size();++i)
             ps.push_back({plates[i].center,plates[i].axis,plates[i].angularVelocity,cats[i]});
-        result.snapshots.push_back(renderSnapshot(ps,elapsed,size,thickness,roughness,settings.seed));
+        result.snapshots.push_back(
+            renderSnapshot(ps, elapsed, size, thickness, roughness, settings.seed, paletteSize));
     }
 
     // Fill result stats from the final snapshot
