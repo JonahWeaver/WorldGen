@@ -5,22 +5,27 @@
 
 struct GeneratorSettings
 {
-    int mapSize = 256;
-    int plateCount = 7;
+    int mapSize = 512;
+    int plateCount = 64;
     int faultIntensity = 2;
     unsigned int seed = 0;
-    float simulationTime = 2.0f;
-    int simulationSteps = 8;
-    float boundaryRoughness = 0.6f;
+    float simulationTime = 120.0f;
+    int simulationSteps = 32;
+    float boundaryRoughness = 0.75f;
     float angularVelocity = 0.25f;
-    bool fragmentation = false;
-    int snapshotCount = 6;
+    bool fragmentation = true;
+    int snapshotCount = 1;
 
     // Civilization simulation settings
-    int   civSteps       = 200;   // number of civilization simulation ticks
-    float growthRate     = 0.08f; // base population growth rate per tick
-    float spreadThresh   = 0.35f; // min habitability for a cell to be settled
-    int   civSnapshots   = 6;     // how many civ timeline snapshots to capture
+    int   civSteps          = 2000;  // number of civilization simulation ticks
+    float growthRate        = 0.008f; // base population growth rate per tick
+    float spreadThresh      = 0.43f; // min habitability for a cell to be settled
+    int   civSnapshots      = 20;    // how many civ timeline snapshots to capture
+
+    // Cohesion settings
+    float cohesionStrength  = 0.87f; // [0,1] scales neighbour-based cohesion ceilings
+    float cohesionHalfLife  = 0.09f; // distance halfLife as fraction of map size
+    float cohesionLerpRate  = 0.04f; // how fast cohesion changes per tick
 };
 
 // Render layers
@@ -60,6 +65,23 @@ struct CivCell
     bool  settled       = false;
 };
 
+// Aggregated per-country data (computed from civCells at the final tick).
+struct CivInfo
+{
+    int   countryId    = -1;
+    int   cultureId    = -1;
+    float totalPop     = 0.f;   // sum of population across all cells
+    int   cellCount    = 0;     // number of cells owned (area proxy)
+    float avgFertility = 0.f;   // mean fertility of owned cells
+    float avgCohesion  = 0.f;   // mean cohesion (political stability)
+    float avgCulture   = 0.f;   // mean culture strength
+    float avgTraversability = 0.f;
+    int   cityCount    = 0;     // cells with pop > 5
+    int   townCount    = 0;     // cells with pop 2-5
+    int   villageCount = 0;     // cells with pop 0.5-2
+    uint32_t colour    = 0;     // display colour (country palette)
+};
+
 // One point-in-time snapshot of the civilization simulation.
 struct CivSnapshot
 {
@@ -89,6 +111,7 @@ struct MapResult
     // Civilization simulation (computed from final geology snapshot)
     std::vector<CivCell>     civCells;    // per-cell data (size×size)
     std::vector<CivSnapshot> civSnaps;    // timeline snapshots
+    std::vector<CivInfo>     civInfos;    // aggregated per-country data (indexed by countryId)
 };
 
 MapResult generateMap(const GeneratorSettings& settings);

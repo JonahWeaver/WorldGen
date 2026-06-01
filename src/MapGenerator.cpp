@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -765,38 +766,8 @@ MapSnapshot renderSnapshot(
         }
     }
 
-    // Wind arrow overlay — draw small arrows every arrowStep pixels
-    // Arrow: a short line from the pixel in the wind direction, plus a tiny head
-    {
-        int arrowStep = std::max(size/24, 6);
-        for(int ay=arrowStep/2; ay<size; ay+=arrowStep)
-        for(int ax=arrowStep/2; ax<size; ax+=arrowStep){
-            int ai=ay*size+ax;
-            float wxi=wx[ai], wyi=wy[ai];
-            int len=arrowStep/2;
-
-            // Shaft
-            for(int s2=0;s2<=len;++s2){
-                int px=ax+int(wxi*s2+0.5f);
-                int py=ay+int(wyi*s2+0.5f);
-                if(px<0||px>=size||py<0||py>=size) continue;
-                pix4[py*size+px]=rgba(255,255,255,200);
-            }
-            // Arrowhead (two short lines at ~45° to shaft)
-            int tx=ax+int(wxi*len+0.5f);
-            int ty=ay+int(wyi*len+0.5f);
-            // Perpendicular
-            float px2=-wyi, py2=wxi;
-            for(int s2=1;s2<=len/2;++s2){
-                auto plot=[&](int bx,int by){
-                    if(bx>=0&&bx<size&&by>=0&&by<size)
-                        pix4[by*size+bx]=rgba(255,255,255,200);
-                };
-                plot(tx+int((-wxi+px2)*s2*0.5f+0.5f), ty+int((-wyi+py2)*s2*0.5f+0.5f));
-                plot(tx+int((-wxi-px2)*s2*0.5f+0.5f), ty+int((-wyi-py2)*s2*0.5f+0.5f));
-            }
-        }
-    }
+    // Wind arrows removed — climate layer shows biome colours only.
+    (void)wx; (void)wy; // suppress unused-variable warnings
 
     // Also update pix3 with eroded elevation so the Elevation layer reflects erosion
     for(int i=0;i<size*size;++i)
@@ -1156,10 +1127,13 @@ MapResult generateMap(const GeneratorSettings& settings)
     // ══════════════════════════════════════════════════════════════════════════
     {
         const MapSnapshot& finalSnap = result.snapshots.back();
-        int civSteps    = std::max(settings.civSteps, 1);
-        int civSnapCount= std::clamp(settings.civSnapshots, 1, 20);
-        float growthRate= std::clamp(settings.growthRate, 0.001f, 1.f);
-        float spreadThr = std::clamp(settings.spreadThresh, 0.f, 1.f);
+        int civSteps      = std::max(settings.civSteps, 1);
+        int civSnapCount  = std::clamp(settings.civSnapshots, 1, 20);
+        float growthRate  = std::clamp(settings.growthRate, 0.001f, 1.f);
+        float spreadThr   = std::clamp(settings.spreadThresh, 0.f, 1.f);
+        float cohStrength = std::clamp(settings.cohesionStrength, 0.f, 1.f);
+        float cohHalfLife = std::clamp(settings.cohesionHalfLife, 0.05f, 1.f) * float(size);
+        float cohLerp     = std::clamp(settings.cohesionLerpRate, 0.01f, 0.5f);
 
         // ── Extract float data from the final snapshot's pixel layers ─────────
         // We re-derive elevation, moisture, temperature, and flow from the
@@ -1257,24 +1231,40 @@ MapResult generateMap(const GeneratorSettings& settings)
         }
 
         // ── Palettes ─────────────────────────────────────────────────────────
-        // We allow up to 256 countries (breakaways create new IDs).
+        // We allow up to 1000 countries (breakaways create new IDs).
         // Culture palette: distinct hues per culture group.
         // Country palette: derived from culture hue but with varied lightness.
         const int maxCultures=plateCount*2+4;
-        const int maxCountries=256;
-        std::vector<uint32_t> cultPalette, countryPalette;
+        const int maxCountries=10000;
+        std::vector<uint32_t> cultPalette;
         cultPalette.reserve(maxCultures);
-        countryPalette.reserve(maxCountries);
         for(int i=0;i<maxCultures;++i)
             cultPalette.push_back(hsvToRgba(360.f*i/maxCultures, 0.75f, 0.90f));
-        // Country colours: same hue as culture but slightly varied saturation/value
-        // so countries within the same culture look related but distinct.
-        for(int i=0;i<maxCountries;++i){
-            float hue=360.f*(i%maxCultures)/maxCultures;
-            float sat=0.55f+0.30f*((i/maxCultures)%3)/2.f;
-            float val=0.70f+0.20f*((i/maxCultures+1)%3)/2.f;
-            countryPalette.push_back(hsvToRgba(hue,sat,val));
-        }
+
+        // Country palette: generated on-demand via a lambda to avoid allocating
+        // 100000 colours upfront (400KB). We compute the colour from the ID directly.
+        // Countries within the same culture share a similar hue but vary in
+        // saturation and value so they remain visually distinct.
+        auto getCountryColour=[&](int id)->uint32_t{
+            float hue=360.f*(id%maxCultures)/maxCultures;
+            // Vary sat/val across 9 bands so colours cycle slowly
+            int band=(id/maxCultures)%9;
+            float sat=0.45f+0.40f*(band%3)/2.f;
+            float val=0.60f+0.30f*(band/3)/2.f;
+            return hsvToRgba(hue,sat,val);
+        };
+        // Lazy colour lookup: compute on first access, cache in unordered_map.
+        std::unordered_map<int,uint32_t> countryPaletteMap;
+        auto getOrMakeColour=[&](int id)->uint32_t{
+            auto it=countryPaletteMap.find(id);
+            if(it!=countryPaletteMap.end()) return it->second;
+            uint32_t col=getCountryColour(id);
+            countryPaletteMap[id]=col;
+            return col;
+        };
+        // Pre-fill seed country colours
+        for(int i=0;i<maxCultures;++i)
+            getOrMakeColour(i);
 
         // nextCountryId: incremented each time a new country is born
         int nextCountryId=maxCultures; // first maxCultures IDs reserved for seed countries
@@ -1284,6 +1274,10 @@ MapResult generateMap(const GeneratorSettings& settings)
         for(int k=1;k<=civSnapCount;++k)
             civSnapTicks.push_back(civSteps*k/civSnapCount);
 
+        // ── Simulation RNG ────────────────────────────────────────────────────
+        std::mt19937 civRng(settings.seed ^ 0xC1710000u);
+        std::uniform_real_distribution<float> roll(0.f, 1.f);
+
         // ── Simulation loop ───────────────────────────────────────────────────
         const int ndx4[4]={1,-1,0,0};
         const int ndy4[4]={0,0,1,-1};
@@ -1291,29 +1285,40 @@ MapResult generateMap(const GeneratorSettings& settings)
         for(int tick=1;tick<=civSteps;++tick){
 
             // ── 1. Population growth ──────────────────────────────────────────
+            // Logistic growth: pop grows toward carrying capacity (fertility-based).
+            // growthRate is the per-tick base rate; fertility scales both rate and cap.
             for(int i=0;i<size*size;++i){
                 CivCell& c=result.civCells[i];
                 if(!c.settled) continue;
-                float cap=c.fertility*10.f+1.f;
-                c.population+=c.population*growthRate*c.fertility*(1.f-c.population/cap);
+                float cap=std::max(c.fertility*12.f+0.5f, 0.5f);
+                float rate=growthRate*(0.3f+c.fertility*0.7f);
+                c.population+=c.population*rate*(1.f-c.population/cap);
                 c.population=std::clamp(c.population,0.f,cap);
             }
 
             // ── 2. Settlement spread ──────────────────────────────────────────
+            // Each settled cell with pop > 0.2 has a chance each tick to
+            // colonise an adjacent unsettled habitable cell.
+            // Spread probability = traversability * min(pop, 3)/3
+            // This means even small populations spread slowly, and large ones spread fast.
             std::vector<std::pair<int,int>> newSettled; // (cell, sourceCell)
             for(int y=1;y<size-1;++y)
             for(int x=0;x<size;++x){
                 int i=y*size+x;
                 CivCell& c=result.civCells[i];
-                if(!c.settled||c.population<0.5f) continue;
+                if(!c.settled||c.population<0.2f) continue;
                 for(int d=0;d<4;++d){
                     int nx2=((x+ndx4[d])%size+size)%size;
                     int ny2=std::clamp(y+ndy4[d],0,size-1);
                     int ni=ny2*size+nx2;
                     CivCell& nc=result.civCells[ni];
                     if(nc.settled||nc.habitability<spreadThr) continue;
-                    float prob=c.traversability*0.15f*(c.population/5.f);
-                    if(prob>0.5f) newSettled.push_back({ni,i});
+                    // Spread probability: traversability × population pressure
+                    // At pop=0.2, trav=1.0: prob=0.067 (spreads in ~15 ticks)
+                    // At pop=3.0, trav=1.0: prob=1.0   (spreads every tick)
+                    float prob=c.traversability*std::min(c.population,3.f)/3.f;
+                    if(roll(civRng)<prob)
+                        newSettled.push_back({ni,i});
                 }
             }
             for(auto& [ni,si]:newSettled){
@@ -1321,7 +1326,7 @@ MapResult generateMap(const GeneratorSettings& settings)
                 CivCell& sc=result.civCells[si];
                 if(!nc.settled){
                     nc.settled=true;
-                    nc.population=0.1f;
+                    nc.population=0.2f;
                     nc.culture=0.05f;
                     nc.cohesion=0.8f;
                     nc.cultureId=sc.cultureId;
@@ -1364,6 +1369,13 @@ MapResult generateMap(const GeneratorSettings& settings)
             }
 
             // ── 4. Culture & cohesion update ──────────────────────────────────
+            // Cohesion is now much more sensitive:
+            //  - Decays faster (lerp rate 0.12 instead of 0.04)
+            //  - Hard terrain (mountains, dense forest) strongly reduces ceiling
+            //  - Isolated cells (0 same-country neighbours) decay toward 0.05
+            //  - Even cells with 1-2 same-country neighbours only recover to 0.45
+            //  - Only cells with 3-4 same-country neighbours recover toward 0.85
+            // This means large empires naturally fragment at their periphery.
             for(int y=1;y<size-1;++y)
             for(int x=0;x<size;++x){
                 int i=y*size+x;
@@ -1387,44 +1399,144 @@ MapResult generateMap(const GeneratorSettings& settings)
                 float cultGrowth=0.004f*(sameCulture+1)+tradeFlow*0.002f;
                 c.culture=std::clamp(c.culture+cultGrowth,0.f,1.f);
 
-                // Cohesion: grows when surrounded by same-country neighbours,
-                // decays when isolated or surrounded by foreign cells.
-                // Also decays with distance from any same-country neighbour.
-                float cohTarget=(sameCountry>=3)?1.f:(sameCountry>=1)?0.6f:0.2f;
-                // Traversability penalty: hard terrain = harder to hold
-                cohTarget*=(0.5f+c.traversability*0.5f);
-                c.cohesion+=(cohTarget-c.cohesion)*0.04f;
-                c.cohesion=std::clamp(c.cohesion,0.f,1.f);
+                // Cohesion ceiling based on neighbour support.
+                // Raised ceilings so countries hold together longer:
+                //   4 neighbours → 0.95 (very stable core)
+                //   3 neighbours → 0.80
+                //   2 neighbours → 0.60
+                //   1 neighbour  → 0.40 (frontier, fragile but survivable)
+                //   0 neighbours → 0.15 (isolated enclave, will eventually break)
+                float cohCeil;
+                if(sameCountry>=4)      cohCeil=0.95f;
+                else if(sameCountry==3) cohCeil=0.80f;
+                else if(sameCountry==2) cohCeil=0.60f;
+                else if(sameCountry==1) cohCeil=0.40f;
+                else                    cohCeil=0.15f;
+
+                // cohStrength scales all ceilings: 0=very fragile, 1=very stable
+                cohCeil *= cohStrength;
+
+                // Terrain penalty: mountains/forest reduce ceiling
+                cohCeil *= (0.5f + c.traversability * 0.5f);
+
+                // cohLerp controls how fast cohesion changes per tick
+                c.cohesion += (cohCeil - c.cohesion) * cohLerp;
+                c.cohesion  = std::clamp(c.cohesion, 0.f, 1.f);
             }
 
-            // ── 5. Breakaway: low-cohesion regions split off ──────────────────
-            // Every 10 ticks, scan for cells with very low cohesion that are
-            // not adjacent to any same-country cell — they become independent.
-            if(tick%10==0 && nextCountryId<maxCountries-1){
+            // ── 5. Distance-from-capital cohesion penalty (every tick) ────────
+            {
+                // Find capital (max-pop cell) per country — use a map to avoid
+                // allocating 100k entries every tick.
+                std::unordered_map<int,int>   capital;   // countryId → cell index
+                std::unordered_map<int,float> capPop;    // countryId → max pop
+                for(int i=0;i<size*size;++i){
+                    CivCell& c=result.civCells[i];
+                    if(!c.settled||c.countryId<0) continue;
+                    auto it=capPop.find(c.countryId);
+                    if(it==capPop.end()||c.population>it->second){
+                        capPop[c.countryId]=c.population;
+                        capital[c.countryId]=i;
+                    }
+                }
+                // BFS from all capitals simultaneously
+                std::vector<int> dist(size*size, -1);
+                std::vector<int> bfsQ;
+                bfsQ.reserve(size*size/4);
+                for(auto& [cid,capCell]:capital){
+                    dist[capCell]=0;
+                    bfsQ.push_back(capCell);
+                }
+                for(int qi=0;qi<int(bfsQ.size());++qi){
+                    int cur=bfsQ[qi];
+                    int cy=cur/size, cx=cur%size;
+                    int cid=result.civCells[cur].countryId;
+                    for(int d=0;d<4;++d){
+                        int nx2=((cx+ndx4[d])%size+size)%size;
+                        int ny2=std::clamp(cy+ndy4[d],0,size-1);
+                        int ni=ny2*size+nx2;
+                        CivCell& nc=result.civCells[ni];
+                        if(dist[ni]<0&&nc.settled&&nc.countryId==cid){
+                            dist[ni]=dist[cur]+1;
+                            bfsQ.push_back(ni);
+                        }
+                    }
+                }
+                // Clamp cohesion to exponential distance ceiling.
+                // halfLife = size/4: cohesion halves every size/4 cells from capital.
+                // At distance size/4:  cap = 0.37  (fragile but survivable)
+                // At distance size/2:  cap = 0.14  (will secede soon)
+                // At distance size*1:  cap = 0.02  (guaranteed secession)
+                // This is gentler than size/8, allowing larger stable empires.
+                float halfLife=cohHalfLife;
+                for(int i=0;i<size*size;++i){
+                    CivCell& c=result.civCells[i];
+                    if(!c.settled||c.countryId<0) continue;
+                    float d=float(dist[i]<0?int(halfLife*4):dist[i]);
+                    float cap2=std::exp(-d/halfLife);
+                    c.cohesion=std::min(c.cohesion, cap2);
+                }
+            }
+
+            // ── 6. Regional breakaway: contiguous low-cohesion chunks secede ──
+            // Every 2 ticks. Seed = any cell with cohesion < 0.35 that has no
+            // same-country neighbour with cohesion > 0.40.
+            // Flood-fill collects all connected same-country cells with cohesion < 0.40.
+            // Even a single cell can secede (no minimum size).
+            if(tick%2==0 && nextCountryId<maxCountries-1){
+                std::vector<bool> processed(size*size,false);
                 for(int y=1;y<size-1;++y)
                 for(int x=0;x<size;++x){
+                    if(nextCountryId>=maxCountries-1) break;
                     int i=y*size+x;
                     CivCell& c=result.civCells[i];
-                    if(!c.settled||c.countryId<0||c.cohesion>0.25f) continue;
-                    // Check if any neighbour shares the same country
+                    if(processed[i]||!c.settled||c.countryId<0||c.cohesion>0.35f) continue;
+
+                    // Check if any neighbour has strong same-country support
                     bool hasSupport=false;
                     for(int d=0;d<4;++d){
                         int nx2=((x+ndx4[d])%size+size)%size;
                         int ny2=std::clamp(y+ndy4[d],0,size-1);
                         int ni=ny2*size+nx2;
                         if(result.civCells[ni].countryId==c.countryId&&
-                           result.civCells[ni].cohesion>0.4f){hasSupport=true;break;}
+                           result.civCells[ni].cohesion>0.40f){hasSupport=true;break;}
                     }
-                    if(!hasSupport){
-                        // Break away: form a new country with the same culture
-                        c.countryId=nextCountryId++;
-                        c.cohesion=0.5f; // fresh start
-                        if(nextCountryId>=maxCountries) break;
+                    if(hasSupport) continue;
+
+                    // Flood-fill: collect all connected same-country cells
+                    // with cohesion < 0.40 — they all secede together
+                    int oldCountry=c.countryId;
+                    int newCountry=nextCountryId++;
+                    std::vector<int> region;
+                    std::vector<int> stack2; stack2.push_back(i);
+                    processed[i]=true;
+                    while(!stack2.empty()){
+                        int cur=stack2.back(); stack2.pop_back();
+                        region.push_back(cur);
+                        int cy=cur/size, cx2=cur%size;
+                        for(int d=0;d<4;++d){
+                            int nx2=((cx2+ndx4[d])%size+size)%size;
+                            int ny2=std::clamp(cy+ndy4[d],0,size-1);
+                            int ni=ny2*size+nx2;
+                            CivCell& nc=result.civCells[ni];
+                            if(!processed[ni]&&nc.settled&&
+                               nc.countryId==oldCountry&&nc.cohesion<0.40f){
+                                processed[ni]=true;
+                                stack2.push_back(ni);
+                            }
+                        }
                     }
+
+                    // Secede — no minimum size requirement
+                    for(int ri:region){
+                        result.civCells[ri].countryId=newCountry;
+                        result.civCells[ri].cohesion=0.50f; // fresh start
+                    }
+                    if(nextCountryId>=maxCountries) break;
                 }
             }
 
-            // ── 6. Snapshot capture ───────────────────────────────────────────
+            // ── 7. Snapshot capture ───────────────────────────────────────────
             for(int k=0;k<int(civSnapTicks.size());++k){
                 if(tick!=civSnapTicks[k]) continue;
 
@@ -1435,18 +1547,18 @@ MapResult generateMap(const GeneratorSettings& settings)
                 // Stats
                 float totPop=0.f; int settledN=0;
                 std::vector<bool> cultSeen(maxCultures,false);
-                std::vector<bool> countrySeen(maxCountries,false);
+                std::unordered_map<int,bool> countrySeen;
                 for(int i=0;i<size*size;++i){
                     CivCell& c=result.civCells[i];
                     if(c.settled){settledN++;totPop+=c.population;}
                     if(c.cultureId>=0&&c.cultureId<maxCultures) cultSeen[c.cultureId]=true;
-                    if(c.countryId>=0&&c.countryId<maxCountries) countrySeen[c.countryId]=true;
+                    if(c.countryId>=0) countrySeen[c.countryId]=true;
                 }
                 snap2.totalPop=totPop;
                 snap2.settledCells=settledN;
                 snap2.cultureGroups=int(std::count(cultSeen.begin(),cultSeen.end(),true));
 
-                // Render: country colour fill + culture tint + borders + city dots
+                // ── Pass 1: country fill + borders ────────────────────────────
                 for(int y2=0;y2<size;++y2)
                 for(int x2=0;x2<size;++x2){
                     int i=y2*size+x2;
@@ -1454,30 +1566,27 @@ MapResult generateMap(const GeneratorSettings& settings)
                     uint32_t base=finalSnap.layerPixels[4][i]; // climate biome
 
                     if(!c.settled){
-                        // Unsettled: dim biome
-                        uint8_t br=uint8_t((base&0xFF)*0.55f);
-                        uint8_t bg=uint8_t(((base>>8)&0xFF)*0.55f);
-                        uint8_t bb=uint8_t(((base>>16)&0xFF)*0.55f);
+                        // Unsettled: dim biome so settled territory stands out
+                        uint8_t br=uint8_t((base&0xFF)*0.50f);
+                        uint8_t bg=uint8_t(((base>>8)&0xFF)*0.50f);
+                        uint8_t bb=uint8_t(((base>>16)&0xFF)*0.50f);
                         snap2.pixels[i]=rgba(br,bg,bb);
                     } else {
-                        // Country colour as primary fill
-                        int cid=std::clamp(c.countryId,0,maxCountries-1);
-                        uint32_t cc2=countryPalette[cid];
-
-                        // Blend: 60% country colour, 25% biome, 15% culture tint
+                        // Country colour as primary fill (50%), biome (35%), culture tint (15%)
+                        uint32_t cc2=getOrMakeColour(c.countryId);
                         int cultId=std::clamp(c.cultureId,0,maxCultures-1);
                         uint32_t cultCol=cultPalette[cultId];
                         float cStr=std::clamp(c.culture*0.15f,0.f,0.15f);
 
                         auto blend3=[&](int shift)->uint8_t{
-                            float bv=(base>>shift&0xFF)/255.f;
-                            float cv=(cc2>>shift&0xFF)/255.f;
-                            float kv=(cultCol>>shift&0xFF)/255.f;
-                            return uint8_t(std::clamp<int>(int((bv*0.25f+cv*0.60f+kv*cStr)*255),0,255));
+                            float bv=float((base>>shift)&0xFF)/255.f;
+                            float cv=float((cc2>>shift)&0xFF)/255.f;
+                            float kv=float((cultCol>>shift)&0xFF)/255.f;
+                            return uint8_t(std::clamp<int>(int((bv*0.35f+cv*0.50f+kv*cStr)*255),0,255));
                         };
                         uint8_t br=blend3(0), bg=blend3(8), bb=blend3(16);
 
-                        // Country border: darken pixels adjacent to a different country
+                        // Country border: 2-pixel dark line between different countries
                         bool isBorder=false;
                         for(int d=0;d<4;++d){
                             int nx2=((x2+ndx4[d])%size+size)%size;
@@ -1485,15 +1594,53 @@ MapResult generateMap(const GeneratorSettings& settings)
                             int ni=ny2*size+nx2;
                             if(result.civCells[ni].countryId!=c.countryId){isBorder=true;break;}
                         }
-                        if(isBorder){br=uint8_t(br*0.35f);bg=uint8_t(bg*0.35f);bb=uint8_t(bb*0.35f);}
+                        if(isBorder){
+                            // Dark border — keep a hint of the country colour
+                            br=uint8_t(br*0.25f);
+                            bg=uint8_t(bg*0.25f);
+                            bb=uint8_t(bb*0.25f);
+                        }
 
                         snap2.pixels[i]=rgba(br,bg,bb);
+                    }
+                }
 
-                        // City dots: high-pop cells
-                        if(c.population>3.f){
-                            float t=std::clamp((c.population-3.f)/7.f,0.f,1.f);
-                            snap2.pixels[i]=rgba(uint8_t(220+t*35),uint8_t(210+t*45),uint8_t(80+t*60));
-                        }
+                // ── Pass 2: settlement symbols (drawn on top of fill) ─────────
+                // City    (pop > 5):  5×5 white dot with coloured ring
+                // Town    (pop 2-5):  3×3 coloured dot
+                // Village (pop 0.5-2): single pixel bright dot
+                auto plotDot=[&](int cx2, int cy2, uint32_t col, int radius){
+                    for(int dy2=-radius;dy2<=radius;++dy2)
+                    for(int dx2=-radius;dx2<=radius;++dx2){
+                        if(dx2*dx2+dy2*dy2>radius*radius) continue;
+                        int px=((cx2+dx2)%size+size)%size;
+                        int py=std::clamp(cy2+dy2,0,size-1);
+                        snap2.pixels[py*size+px]=col;
+                    }
+                };
+
+                for(int y2=0;y2<size;++y2)
+                for(int x2=0;x2<size;++x2){
+                    int i=y2*size+x2;
+                    CivCell& c=result.civCells[i];
+                    if(!c.settled) continue;
+
+                    if(c.population>5.f){
+                        // City: white center + coloured ring
+                        uint32_t ring=getOrMakeColour(c.countryId);
+                        plotDot(x2,y2,ring,3);
+                        plotDot(x2,y2,rgba(255,255,255),1);
+                    } else if(c.population>2.f){
+                        // Town: solid coloured dot
+                        uint32_t col=getOrMakeColour(c.countryId);
+                        // Brighten the country colour for the dot
+                        uint8_t dr=uint8_t(std::clamp<int>(int((col&0xFF)*1.4f),0,255));
+                        uint8_t dg=uint8_t(std::clamp<int>(int(((col>>8)&0xFF)*1.4f),0,255));
+                        uint8_t db=uint8_t(std::clamp<int>(int(((col>>16)&0xFF)*1.4f),0,255));
+                        plotDot(x2,y2,rgba(dr,dg,db),1);
+                    } else if(c.population>0.5f){
+                        // Village: single bright pixel
+                        snap2.pixels[y2*size+x2]=rgba(220,210,180);
                     }
                 }
 
@@ -1501,7 +1648,57 @@ MapResult generateMap(const GeneratorSettings& settings)
                 result.civSnaps.push_back(std::move(snap2));
             }
         }
-    }
+
+        // ── Aggregate per-country CivInfo ─────────────────────────────────────
+        // Build a map from countryId → CivInfo using the final civCells state.
+        {
+            std::unordered_map<int,CivInfo> infoMap;
+            for(int i=0;i<size*size;++i){
+                const CivCell& c=result.civCells[i];
+                if(!c.settled||c.countryId<0) continue;
+                if(infoMap.find(c.countryId)==infoMap.end()){
+                    CivInfo& ni2=infoMap[c.countryId];
+                    ni2.countryId=c.countryId;
+                    ni2.colour=getOrMakeColour(c.countryId);
+                }
+            }
+            // Reset and re-aggregate
+            for(auto& [id,info]:infoMap){
+                info.totalPop=0.f; info.cellCount=0;
+                info.avgFertility=0.f; info.avgCohesion=0.f;
+                info.avgCulture=0.f; info.avgTraversability=0.f;
+                info.cityCount=0; info.townCount=0; info.villageCount=0;
+            }
+            for(int i=0;i<size*size;++i){
+                const CivCell& c=result.civCells[i];
+                if(!c.settled||c.countryId<0) continue;
+                auto it=infoMap.find(c.countryId);
+                if(it==infoMap.end()) continue;
+                CivInfo& info=it->second;
+                info.cultureId=c.cultureId;
+                info.totalPop+=c.population;
+                info.cellCount++;
+                info.avgFertility+=c.fertility;
+                info.avgCohesion+=c.cohesion;
+                info.avgCulture+=c.culture;
+                info.avgTraversability+=c.traversability;
+                if(c.population>5.f)      info.cityCount++;
+                else if(c.population>2.f) info.townCount++;
+                else if(c.population>0.5f)info.villageCount++;
+            }
+            result.civInfos.clear();
+            for(auto& [id,info]:infoMap){
+                if(info.cellCount>0){
+                    float n=float(info.cellCount);
+                    info.avgFertility/=n;
+                    info.avgCohesion/=n;
+                    info.avgCulture/=n;
+                    info.avgTraversability/=n;
+                    result.civInfos.push_back(info);
+                }
+            }
+        }
+    } // end civ simulation block
 
     return result;
 }

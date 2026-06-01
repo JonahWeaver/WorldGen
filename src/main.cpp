@@ -203,6 +203,15 @@ int main()
     bool showCivLayer   = false;  // toggle between geology layers and civ view
     int  activeCivSnap  = int(map.civSnaps.size())-1;
 
+    // ── Civ click-to-inspect ──────────────────────────────────────────────────
+    int  inspectCountryId = -1;   // -1 = nothing selected
+    bool showCivPopup     = false;
+
+    // Debug: track last computed map UV and cell
+    float dbgU = -1.f, dbgV = -1.f;
+    int   dbgMapX = -1, dbgMapY = -1, dbgCountryId = -2;
+    bool  showCivDebug = false;
+
     while (!glfwWindowShouldClose(window))
     {
         double now = glfwGetTime();
@@ -277,6 +286,175 @@ int main()
         {
             glOrtho(-aspect, aspect, -1.f, 1.f, 0.1f, 10.f);
             drawFlatMap(displayMerc, aspect);
+        }
+
+        // ── Civ click-to-inspect + debug overlay (2D map only) ───────────────
+        if (viewMode == Map2DView)
+        {
+            // Shared coordinate transform (used for both debug and click)
+            float mapW = 1.6f;
+            float mapH = mapW / aspect;
+            float ndcX = (float(mx) / float(dw)) * 2.f * aspect - aspect;
+            float ndcY = 1.f - (float(my) / float(dh)) * 2.f;
+            float u = (ndcX + mapW) / (2.f * mapW);
+            float v = 1.f - (ndcY + mapH) / (2.f * mapH);
+
+            constexpr float PI2 = 3.14159265358979323846f;
+            float mercY = std::clamp(v, 0.001f, 0.999f);
+            float lat   = std::atan(std::sinh(PI2 * (1.f - 2.f * mercY)));
+            float eqV   = std::clamp(0.5f - lat / PI2, 0.f, 1.f);
+
+            int liveMapX = std::clamp(int(u   * map.size), 0, map.size - 1);
+            int liveMapY = std::clamp(int(eqV * map.size), 0, map.size - 1);
+            bool onMap   = (u >= 0.f && u <= 1.f && v >= 0.f && v <= 1.f);
+
+            // ── Debug crosshair drawn via ImGui DrawList ──────────────────────
+            if (showCivDebug && onMap)
+            {
+                // Convert the computed map UV back to screen pixels for the crosshair
+                // (this shows exactly where the transform thinks the cursor is)
+                float crossU = u;
+                float crossEqV = eqV;
+                // eqV → mercator v (forward Mercator)
+                float crossMercV = (1.f - std::log(std::tan(PI2*(0.5f - crossEqV) + PI2/4.f)) / PI2) * 0.5f;
+                float crossNdcX  = crossU * 2.f * mapW - mapW;
+                float crossNdcY  = 1.f - (1.f - crossMercV) * 2.f * mapH;
+                // NDC → screen pixels
+                float crossSX = (crossNdcX + aspect) / (2.f * aspect) * float(dw);
+                float crossSY = (1.f - crossNdcY) * 0.5f * float(dh);
+
+                ImDrawList* dl = ImGui::GetBackgroundDrawList();
+                float cs = 12.f;
+                dl->AddLine(ImVec2(crossSX-cs, crossSY), ImVec2(crossSX+cs, crossSY),
+                            IM_COL32(255,50,50,220), 2.f);
+                dl->AddLine(ImVec2(crossSX, crossSY-cs), ImVec2(crossSX, crossSY+cs),
+                            IM_COL32(255,50,50,220), 2.f);
+                dl->AddCircle(ImVec2(crossSX, crossSY), 6.f,
+                              IM_COL32(255,200,50,220), 12, 1.5f);
+            }
+
+            // ── Debug info window ─────────────────────────────────────────────
+            if (showCivDebug)
+            {
+                ImGui::SetNextWindowPos(ImVec2(float(dw)-260.f, 10.f), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(250, 0), ImGuiCond_Always);
+                ImGui::SetNextWindowBgAlpha(0.85f);
+                ImGui::Begin("##civdbg", nullptr,
+                    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);
+                ImGui::TextColored(ImVec4(1,0.8f,0.2f,1), "Civ Click Debug");
+                ImGui::Separator();
+                ImGui::Text("Screen  : (%.0f, %.0f)", float(mx), float(my));
+                ImGui::Text("NDC     : (%.3f, %.3f)", ndcX, ndcY);
+                ImGui::Text("UV      : (%.3f, %.3f)", u, v);
+                ImGui::Text("On map  : %s", onMap ? "YES" : "NO");
+                ImGui::Text("Lat     : %.2f deg", lat * 180.f / PI2);
+                ImGui::Text("EqV     : %.3f", eqV);
+                ImGui::Text("MapXY   : (%d, %d)", liveMapX, liveMapY);
+                if (onMap && !map.civCells.empty())
+                {
+                    int idx = liveMapY * map.size + liveMapX;
+                    const CivCell& lc = map.civCells[idx];
+                    ImGui::Text("Settled : %s", lc.settled ? "YES" : "NO");
+                    ImGui::Text("Country : %d", lc.countryId);
+                    ImGui::Text("Pop     : %.2f", lc.population);
+                    ImGui::Text("Hab     : %.2f", lc.habitability);
+                }
+                ImGui::Text("Last click country: %d", dbgCountryId);
+                ImGui::End();
+            }
+
+            // ── Click handler ─────────────────────────────────────────────────
+            if (showCivLayer && !map.civCells.empty() &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !io.WantCaptureMouse)
+            {
+                dbgU = u; dbgV = v; dbgMapX = liveMapX; dbgMapY = liveMapY;
+
+                if (onMap)
+                {
+                    int cellIdx = liveMapY * map.size + liveMapX;
+                    const CivCell& cell = map.civCells[cellIdx];
+                    dbgCountryId = cell.countryId;
+                    if (cell.settled && cell.countryId >= 0)
+                    {
+                        inspectCountryId = cell.countryId;
+                        showCivPopup = true;
+                    }
+                    else
+                    {
+                        inspectCountryId = -1;
+                        showCivPopup = false;
+                    }
+                }
+            }
+        }
+
+        // ── Civ info popup ────────────────────────────────────────────────────
+        if (showCivPopup && inspectCountryId >= 0)
+        {
+            // Find the CivInfo for this country
+            const CivInfo* info = nullptr;
+            for (const auto& ci2 : map.civInfos)
+                if (ci2.countryId == inspectCountryId) { info = &ci2; break; }
+
+            if (info)
+            {
+                ImGui::SetNextWindowPos(ImVec2(float(dw)*0.5f, float(dh)*0.5f),
+                                        ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+                ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_Appearing);
+                ImGui::Begin("Civilization Info", &showCivPopup,
+                             ImGuiWindowFlags_AlwaysAutoResize);
+
+                // Colour swatch
+                uint32_t col = info->colour;
+                float cr2 = (col & 0xFF) / 255.f;
+                float cg2 = ((col >> 8) & 0xFF) / 255.f;
+                float cb2 = ((col >> 16) & 0xFF) / 255.f;
+                ImGui::ColorButton("##civcolour", ImVec4(cr2, cg2, cb2, 1.f),
+                                   ImGuiColorEditFlags_NoTooltip, ImVec2(18, 18));
+                ImGui::SameLine();
+                ImGui::Text("Country #%d  (Culture group %d)",
+                            info->countryId, info->cultureId);
+
+                ImGui::Separator();
+
+                // Population & area
+                ImGui::Text("Population   : %.1f", info->totalPop);
+                ImGui::Text("Territory    : %d cells  (~%.1f%%)",
+                            info->cellCount,
+                            100.f * float(info->cellCount) / float(map.size * map.size));
+
+                ImGui::Separator();
+
+                // Settlements
+                ImGui::Text("Cities       : %d  (pop > 5)", info->cityCount);
+                ImGui::Text("Towns        : %d  (pop 2-5)", info->townCount);
+                ImGui::Text("Villages     : %d  (pop 0.5-2)", info->villageCount);
+
+                ImGui::Separator();
+
+                // Averages — shown as progress bars for quick visual read
+                ImGui::Text("Avg Fertility     "); ImGui::SameLine();
+                ImGui::ProgressBar(info->avgFertility, ImVec2(-1, 0));
+
+                ImGui::Text("Avg Cohesion      "); ImGui::SameLine();
+                ImGui::ProgressBar(info->avgCohesion, ImVec2(-1, 0));
+
+                ImGui::Text("Avg Culture       "); ImGui::SameLine();
+                ImGui::ProgressBar(info->avgCulture, ImVec2(-1, 0));
+
+                ImGui::Text("Avg Traversability"); ImGui::SameLine();
+                ImGui::ProgressBar(info->avgTraversability, ImVec2(-1, 0));
+
+                ImGui::Separator();
+                if (ImGui::Button("Close", ImVec2(-1, 0))) showCivPopup = false;
+
+                ImGui::End();
+            }
+            else
+            {
+                showCivPopup = false;
+            }
         }
 
         // ── H key toggles panel visibility ───────────────────────────────────
@@ -422,6 +600,18 @@ int main()
             ImGui::SliderInt("Civ Snapshots",    &settings.civSnapshots,   1,   20);
             ImGui::SliderFloat("Growth Rate",    &settings.growthRate,  0.001f, 0.5f, "%.3f");
             ImGui::SliderFloat("Spread Thresh",  &settings.spreadThresh, 0.f,   1.f, "%.2f");
+
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.9f,0.8f,0.4f,1.f), "Cohesion");
+            ImGui::SliderFloat("Coh Strength",   &settings.cohesionStrength, 0.f,  1.f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Scales all neighbour-based cohesion ceilings.\n0 = very fragile (constant fragmentation)\n1 = very stable (large empires persist)");
+            ImGui::SliderFloat("Coh Half-Life",  &settings.cohesionHalfLife, 0.05f, 1.f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Distance from capital (as fraction of map size)\nat which cohesion halves.\n0.05 = tiny empires  0.5 = continent-spanning");
+            ImGui::SliderFloat("Coh Lerp Rate",  &settings.cohesionLerpRate, 0.01f, 0.3f, "%.3f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How fast cohesion changes per tick.\nLow = slow, gradual fragmentation\nHigh = rapid, dramatic splits");
         }
 
         if (ImGui::Button("Generate", ImVec2(-1, 0)))
@@ -444,6 +634,9 @@ int main()
         ImGui::Separator();
         ImGui::Checkbox("Auto Rotate", &rotateGlobe);
         ImGui::SliderFloat("Rotation Speed", &rotationSpeed, 0.f, 90.f, "%.1f deg/s");
+        ImGui::Checkbox("Civ Click Debug", &showCivDebug);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Shows crosshair + coordinate debug panel\nwhen in 2D Map view.\nHelps verify click-to-inspect accuracy.");
 
         ImGui::Separator();
         ImGui::Text("Requested plates : %d", settings.plateCount);
@@ -462,10 +655,10 @@ int main()
         glfwSwapBuffers(window);
     }
 
-    for (auto& st2 : snapTextures) deleteSnapTextures(st2);
-    for (auto& ct : civTextures){
-        if(ct.globe)    glDeleteTextures(1,&ct.globe);
-        if(ct.mercator) glDeleteTextures(1,&ct.mercator);
+    for (int si = 0; si < int(snapTextures.size()); ++si) deleteSnapTextures(snapTextures[si]);
+    for (int ci = 0; ci < int(civTextures.size()); ++ci){
+        if(civTextures[ci].globe)    glDeleteTextures(1,&civTextures[ci].globe);
+        if(civTextures[ci].mercator) glDeleteTextures(1,&civTextures[ci].mercator);
     }
     ImGui_ImplOpenGL2_Shutdown();
     ImGui_ImplGlfw_Shutdown();
