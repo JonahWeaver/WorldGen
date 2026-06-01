@@ -180,6 +180,7 @@ int main()
     bool rotateGlobe = true;
     float rotationSpeed = 18.f;
     double lastTime = glfwGetTime();
+    bool showPanel = true;   // H key or button toggles the panel
 
     while (!glfwWindowShouldClose(window))
     {
@@ -240,13 +241,32 @@ int main()
             drawFlatMap(st.mercator[activeLayer], aspect);
         }
 
-        // ── UI panel ─────────────────────────────────────────────────────────
-        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_Always);
-        ImGui::Begin("Map Controls", nullptr,
-            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+        // ── H key toggles panel visibility ───────────────────────────────────
+        if (!io.WantCaptureKeyboard &&
+            ImGui::IsKeyPressed(ImGuiKey_H, false))
+            showPanel = !showPanel;
 
-        ImGui::TextWrapped("Generate tectonic plates and choose the display mode.");
+        // ── Tiny "Show Panel" button when panel is hidden ─────────────────────
+        if (!showPanel)
+        {
+            ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.75f);
+            ImGui::Begin("##showbtn", nullptr,
+                ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);
+            if (ImGui::Button("Show Panel  [H]")) showPanel = true;
+            ImGui::End();
+        }
+
+        // ── Main panel ────────────────────────────────────────────────────────
+        if (showPanel)
+        {
+        // First use: place at top-left; after that the user can drag it anywhere.
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(370, 0), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Map Controls", &showPanel);   // X button also hides it
+
+        ImGui::TextWrapped("Drag title bar to move  |  Click ▼ to collapse  |  H = hide");
 
         ImGui::RadioButton("Globe",   reinterpret_cast<int*>(&viewMode), GlobeView);
         ImGui::SameLine();
@@ -353,6 +373,7 @@ int main()
         ImGui::Text("Divergent        : %d", map.divergentCount);
 
         ImGui::End();
+        } // end if (showPanel)
 
         ImGui::Render();
         ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
