@@ -203,6 +203,23 @@ int main()
     bool showCivLayer   = false;  // toggle between geology layers and civ view
     int  activeCivSnap  = int(map.civSnaps.size())-1;
 
+    // ── Resource layer textures ───────────────────────────────────────────────
+    GLuint resourceGlobeTex = 0, resourceMercTex = 0;
+    bool   showResourceLayer = false;
+    auto uploadResourceTextures = [&](){
+        if(resourceGlobeTex) glDeleteTextures(1,&resourceGlobeTex);
+        if(resourceMercTex)  glDeleteTextures(1,&resourceMercTex);
+        resourceGlobeTex = resourceMercTex = 0;
+        if(!map.resourcePixels.empty())
+            resourceGlobeTex = createTexture(map.size, map.resourcePixels.data());
+        if(!map.resourceMercator.empty())
+            resourceMercTex  = createTexture(map.size, map.resourceMercator.data());
+    };
+    uploadResourceTextures();
+
+    // ── Event log window ──────────────────────────────────────────────────────
+    bool showEventLog = false;
+
     // ── Civ click-to-inspect ──────────────────────────────────────────────────
     int  inspectCountryId = -1;   // -1 = nothing selected
     bool showCivPopup     = false;
@@ -265,7 +282,12 @@ int main()
 
         // Choose which texture to display
         GLuint displayGlobe = 0, displayMerc = 0;
-        if (showCivLayer && !civTextures.empty())
+        if (showResourceLayer && resourceGlobeTex)
+        {
+            displayGlobe = resourceGlobeTex;
+            displayMerc  = resourceMercTex;
+        }
+        else if (showCivLayer && !civTextures.empty())
         {
             displayGlobe = civTextures[activeCivSnap].globe;
             displayMerc  = civTextures[activeCivSnap].mercator;
@@ -433,18 +455,56 @@ int main()
 
                 ImGui::Separator();
 
-                // Averages — shown as progress bars for quick visual read
+                // Averages
                 ImGui::Text("Avg Fertility     "); ImGui::SameLine();
                 ImGui::ProgressBar(info->avgFertility, ImVec2(-1, 0));
-
                 ImGui::Text("Avg Cohesion      "); ImGui::SameLine();
                 ImGui::ProgressBar(info->avgCohesion, ImVec2(-1, 0));
-
                 ImGui::Text("Avg Culture       "); ImGui::SameLine();
                 ImGui::ProgressBar(info->avgCulture, ImVec2(-1, 0));
-
                 ImGui::Text("Avg Traversability"); ImGui::SameLine();
                 ImGui::ProgressBar(info->avgTraversability, ImVec2(-1, 0));
+
+                // Economy
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(1.f,0.85f,0.3f,1.f), "Economy");
+                ImGui::Text("Income/tick  : %.2f", info->income);
+                ImGui::Text("Science/tick : %.2f", info->scienceRate);
+                ImGui::Text("Trade vol    : %.2f", info->tradeVolume);
+
+                // Resources
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.6f,1.f,0.6f,1.f), "Resource Stockpiles");
+                static const char* resNames[RESOURCE_COUNT] = {
+                    "Iron","Wood","Niter","ManaStone","Gold","Silver","Copper"};
+                for(int r=0;r<RESOURCE_COUNT;++r){
+                    if(info->totalResources[r]>0.01f)
+                        ImGui::Text("  %-10s : %.1f", resNames[r], info->totalResources[r]);
+                }
+
+                // Cultural attributes
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.8f,0.6f,1.f,1.f), "Cultural Attributes");
+                static const char* attrNames[CULT_ATTR_COUNT] = {
+                    "Militarism","Mercantilism","Piety","Scholarship","Isolationism"};
+                for(int a=0;a<CULT_ATTR_COUNT;++a){
+                    float v2 = std::clamp(info->culturalAttrs[a]/2.5f, 0.f, 1.f);
+                    ImGui::Text("  %-14s", attrNames[a]); ImGui::SameLine();
+                    ImGui::ProgressBar(v2, ImVec2(-1, 0));
+                }
+
+                // Technologies
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.4f,0.8f,1.f,1.f), "Technologies");
+                int techsShown = 0;
+                for(int t=0;t<TECH_COUNT;++t){
+                    if(info->techs[t]){
+                        if(techsShown>0 && techsShown%3!=0) ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(0.5f,1.f,0.5f,1.f), "[%s]", techName(TechId(t)));
+                        ++techsShown;
+                    }
+                }
+                if(techsShown==0) ImGui::TextDisabled("  (none yet)");
 
                 ImGui::Separator();
                 if (ImGui::Button("Close", ImVec2(-1, 0))) showCivPopup = false;
@@ -455,6 +515,52 @@ int main()
             {
                 showCivPopup = false;
             }
+        }
+
+        // ── Event Log window ──────────────────────────────────────────────────
+        if (showEventLog && !map.eventLog.empty())
+        {
+            ImGui::SetNextWindowPos(ImVec2(float(dw)-420.f, 40.f), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(410, 500), ImGuiCond_FirstUseEver);
+            ImGui::Begin("Event Log", &showEventLog);
+
+            static const char* evTypeNames[] = {
+                "Founded","Conquest","Secession","Merger","Tech","City","Collapse"};
+            static const ImVec4 evTypeColors[] = {
+                ImVec4(0.5f,1.f,0.5f,1.f),   // Founded: green
+                ImVec4(1.f,0.4f,0.4f,1.f),   // Conquest: red
+                ImVec4(1.f,0.8f,0.2f,1.f),   // Secession: yellow
+                ImVec4(0.4f,0.8f,1.f,1.f),   // Merger: blue
+                ImVec4(0.9f,0.6f,1.f,1.f),   // Tech: purple
+                ImVec4(1.f,1.f,0.5f,1.f),    // City: pale yellow
+                ImVec4(0.6f,0.6f,0.6f,1.f),  // Collapse: grey
+            };
+
+            // Filter controls
+            static int filterType = -1; // -1 = all
+            ImGui::Text("Filter:");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("All")) filterType = -1;
+            for (int t = 0; t < 7; ++t) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton(evTypeNames[t])) filterType = t;
+            }
+            ImGui::Text("Total events: %d", int(map.eventLog.size()));
+            ImGui::Separator();
+
+            ImGui::BeginChild("##evlog", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), false);
+            // Show most recent events first
+            for (int i = int(map.eventLog.size())-1; i >= 0; --i) {
+                const CivEvent& ev = map.eventLog[i];
+                int etype = int(ev.type);
+                if (filterType >= 0 && etype != filterType) continue;
+                ImGui::TextColored(evTypeColors[etype], "[T%4d] %-9s",
+                                   ev.tick, evTypeNames[etype]);
+                ImGui::SameLine();
+                ImGui::TextUnformatted(ev.note.c_str());
+            }
+            ImGui::EndChild();
+            ImGui::End();
         }
 
         // ── H key toggles panel visibility ───────────────────────────────────
@@ -546,8 +652,15 @@ int main()
 
         ImGui::Separator();
 
+        // ── Resource layer ────────────────────────────────────────────────────
+        ImGui::Checkbox("Show Resource Layer", &showResourceLayer);
+        if (showResourceLayer) showCivLayer = false; // mutually exclusive
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Overlays resource deposits on the climate biome map.\nIron=blue  Wood=green  Niter=pale blue  ManaStone=magenta\nGold=teal  Silver=silver  Copper=copper");
+
         // ── Civilization layer ────────────────────────────────────────────────
-        ImGui::Checkbox("Show Civilization Layer", &showCivLayer);
+        if (ImGui::Checkbox("Show Civilization Layer", &showCivLayer))
+            if (showCivLayer) showResourceLayer = false;
         if (showCivLayer && !civTextures.empty())
         {
             int civCount = int(map.civSnaps.size());
@@ -629,6 +742,9 @@ int main()
             // Upload new civilization textures
             uploadCivSnaps();
             activeCivSnap = int(map.civSnaps.size())-1;
+
+            // Upload resource textures
+            uploadResourceTextures();
         }
 
         ImGui::Separator();
@@ -646,6 +762,12 @@ int main()
         ImGui::Text("Convergent       : %d", map.convergentCount);
         ImGui::Text("Transform        : %d", map.transformCount);
         ImGui::Text("Divergent        : %d", map.divergentCount);
+        if (!map.eventLog.empty()) {
+            ImGui::Text("Events logged    : %d", int(map.eventLog.size()));
+            ImGui::Text("Countries (final): %d", int(map.countryStates.size()));
+            if (ImGui::Button("Event Log", ImVec2(-1, 0)))
+                showEventLog = !showEventLog;
+        }
 
         ImGui::End();
         } // end if (showPanel)

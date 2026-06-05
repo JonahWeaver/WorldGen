@@ -1160,42 +1160,147 @@ MapResult generateMap(const GeneratorSettings& settings)
             uint32_t ep=finalSnap.layerPixels[3][i];
             float er=(ep&0xFF)/255.f, eg=((ep>>8)&0xFF)/255.f, eb=((ep>>16)&0xFF)/255.f;
             // Ocean detection: blue dominant and dark
-            bool isOcean=(eb>er+0.05f && eb>eg+0.05f && lum(ep)<0.35f);
-            if(isOcean){ c.habitability=0.f; c.fertility=0.f; c.traversability=0.f; continue; }
+            bool isOceanCell=(eb>er+0.05f && eb>eg+0.05f && lum(ep)<0.35f);
+            c.isOcean = isOceanCell;
+            if(isOceanCell){ c.habitability=0.f; c.fertility=0.f; c.traversability=0.f; continue; }
 
-            float elevLum=lum(ep); // 0=deep ocean, ~0.3=coast, ~0.6=highland, ~0.9=peak
+            float elevLum=lum(ep);
 
-            // Climate pixel: green=fertile, sandy=arid, white=cold
+            // Climate pixel
             uint32_t cp=finalSnap.layerPixels[4][i];
             float cr=(cp&0xFF)/255.f, cg=((cp>>8)&0xFF)/255.f, cb2=((cp>>16)&0xFF)/255.f;
-            // Greenness = vegetation proxy
             float greenness=std::clamp(cg-(cr+cb2)*0.5f, 0.f, 1.f)*2.f;
-            // Warmth: red/yellow tones = warm
             float warmth=std::clamp((cr+cg*0.5f-cb2)*0.8f, 0.f, 1.f);
-            // Coldness: blue/white tones = cold/polar
             float coldness=std::clamp(cb2-(cr+cg)*0.3f, 0.f, 1.f);
 
-            // Hydrology pixel: blue=river/lake, green-tinted=riparian
+            // Hydrology pixel
             uint32_t hp=finalSnap.layerPixels[5][i];
             float hr=(hp&0xFF)/255.f, hg=((hp>>8)&0xFF)/255.f, hb=((hp>>16)&0xFF)/255.f;
-            float riverProx=std::clamp(hb-(hr+hg)*0.4f, 0.f, 1.f); // blue = near water
+            float riverProx=std::clamp(hb-(hr+hg)*0.4f, 0.f, 1.f);
 
             // ── Habitability ─────────────────────────────────────────────────
-            // Best: temperate, low-mid elevation, near water, not too cold/hot
-            float elevPenalty=std::clamp((elevLum-0.55f)*3.f, 0.f, 1.f); // mountains bad
+            float elevPenalty=std::clamp((elevLum-0.55f)*3.f, 0.f, 1.f);
             float tempScore=std::clamp(warmth*0.6f+greenness*0.4f-coldness*0.8f, 0.f, 1.f);
             float waterBonus=riverProx*0.3f;
             c.habitability=std::clamp(tempScore*(1.f-elevPenalty*0.7f)+waterBonus, 0.f, 1.f);
 
             // ── Fertility ─────────────────────────────────────────────────────
-            // Flat, moist, warm land with river access
             float flatness=std::clamp(1.f-elevLum*1.5f, 0.f, 1.f);
             c.fertility=std::clamp(greenness*0.5f+flatness*0.3f+riverProx*0.2f, 0.f, 1.f);
 
             // ── Traversability ────────────────────────────────────────────────
-            // Flat land and rivers are easy; mountains and dense forest are hard
             float forestPenalty=std::clamp(greenness-0.5f, 0.f, 1.f)*0.4f;
             c.traversability=std::clamp(flatness*0.7f+riverProx*0.2f-forestPenalty, 0.f, 1.f);
+            c.effectiveTraversability = c.traversability; // updated each tick with sea routes
+
+            // ── Sea access: proximity to ocean ────────────────────────────────
+            // Computed after the loop via BFS from ocean cells.
+            c.seaAccess = 0.f;
+        }
+
+        // ── Sea access BFS ────────────────────────────────────────────────────
+        // Flood-fill from ocean cells outward; seaAccess decays with distance.
+        {
+            const float seaDecay = 0.85f; // per cell
+            std::vector<float> seaDist(size*size, 0.f);
+            std::vector<int> bfsQ; bfsQ.reserve(size*size/4);
+            for(int i=0;i<size*size;++i)
+                if(result.civCells[i].isOcean){ seaDist[i]=1.f; bfsQ.push_back(i); }
+            for(int qi=0;qi<int(bfsQ.size());++qi){
+                int cur=bfsQ[qi];
+                int cy=cur/size, cx=cur%size;
+                float next=seaDist[cur]*seaDecay;
+                if(next<0.01f) continue;
+                for(int d=0;d<4;++d){
+                    int nx2=((cx+(d==0?1:d==1?-1:0))%size+size)%size;
+                    int ny2=std::clamp(cy+(d==2?1:d==3?-1:0),0,size-1);
+                    int ni=ny2*size+nx2;
+                    if(seaDist[ni]<next){
+                        seaDist[ni]=next;
+                        bfsQ.push_back(ni);
+                    }
+                }
+            }
+            for(int i=0;i<size*size;++i)
+                result.civCells[i].seaAccess=seaDist[i];
+        }
+
+        // ── Resource generation ───────────────────────────────────────────────
+        // Resources are placed using seeded noise so they're deterministic.
+        // Each resource type has characteristic terrain preferences.
+        {
+            std::mt19937 resRng(settings.seed ^ 0xE500EE55u);
+            std::uniform_real_distribution<float> ud(0.f,1.f);
+            // For each cell, probabilistically place resources based on terrain
+            for(int y=0;y<size;++y)
+            for(int x=0;x<size;++x){
+                int i=y*size+x;
+                CivCell& c=result.civCells[i];
+                if(c.isOcean) continue;
+
+                uint32_t ep=finalSnap.layerPixels[3][i];
+                float elevLum2=lum(ep);
+                float flatness2=std::clamp(1.f-elevLum2*1.5f,0.f,1.f);
+                bool isMountain=(elevLum2>0.65f);
+                bool isHighland=(elevLum2>0.45f);
+
+                // Iron: mountains and highlands
+                if(isMountain && ud(resRng)<0.12f)
+                    c.resources[int(ResourceType::Iron)]=0.3f+ud(resRng)*0.7f;
+                // Wood: mid-high fertility (forests)
+                if(c.fertility>0.4f && ud(resRng)<0.15f)
+                    c.resources[int(ResourceType::Wood)]=0.3f+ud(resRng)*0.5f;
+                // Niter: dry flatlands
+                if(flatness2>0.6f && c.fertility<0.3f && ud(resRng)<0.06f)
+                    c.resources[int(ResourceType::Niter)]=0.4f+ud(resRng)*0.6f;
+                // ManaStone: rare, near mountains
+                if(isHighland && ud(resRng)<0.025f)
+                    c.resources[int(ResourceType::ManaStone)]=0.5f+ud(resRng)*0.5f;
+                // Gold: mountains and highlands
+                if(isHighland && ud(resRng)<0.05f)
+                    c.resources[int(ResourceType::Gold)]=0.3f+ud(resRng)*0.7f;
+                // Silver: mountains
+                if(isMountain && ud(resRng)<0.07f)
+                    c.resources[int(ResourceType::Silver)]=0.3f+ud(resRng)*0.6f;
+                // Copper: highlands and flatlands
+                if(!isMountain && ud(resRng)<0.08f)
+                    c.resources[int(ResourceType::Copper)]=0.3f+ud(resRng)*0.5f;
+            }
+        }
+
+        // ── Resource overlay pixels ───────────────────────────────────────────
+        {
+            // Resource colours (one per type)
+            static const uint32_t resColours[RESOURCE_COUNT] = {
+                0xFF4040C0u, // Iron: steel blue
+                0xFF206020u, // Wood: dark green
+                0xFF80C0FFu, // Niter: pale blue
+                0xFFFF80FFu, // ManaStone: magenta
+                0xFF20C0C0u, // Gold: gold (stored as ABGR)
+                0xFFC0C0C0u, // Silver: silver
+                0xFF4080C0u, // Copper: copper
+            };
+            result.resourcePixels.assign(size*size, 0u);
+            for(int i=0;i<size*size;++i){
+                CivCell& c=result.civCells[i];
+                // Find the richest resource in this cell
+                float best=0.f; int bestR=-1;
+                for(int r=0;r<RESOURCE_COUNT;++r)
+                    if(c.resources[r]>best){best=c.resources[r];bestR=r;}
+                if(bestR>=0 && best>0.3f){
+                    // Blend resource colour with base biome
+                    uint32_t base=finalSnap.layerPixels[4][i];
+                    uint32_t rc=resColours[bestR];
+                    float t=std::clamp(best*0.7f,0.f,0.7f);
+                    uint8_t rr=uint8_t((base&0xFF)*(1-t)+((rc)&0xFF)*t);
+                    uint8_t rg=uint8_t(((base>>8)&0xFF)*(1-t)+((rc>>8)&0xFF)*t);
+                    uint8_t rb=uint8_t(((base>>16)&0xFF)*(1-t)+((rc>>16)&0xFF)*t);
+                    result.resourcePixels[i]=rgba(rr,rg,rb);
+                } else {
+                    result.resourcePixels[i]=finalSnap.layerPixels[4][i];
+                }
+            }
+            result.resourceMercator=toMercator(result.resourcePixels,size);
         }
 
         // ── Seed initial settlements ──────────────────────────────────────────
@@ -1268,6 +1373,97 @@ MapResult generateMap(const GeneratorSettings& settings)
 
         // nextCountryId: incremented each time a new country is born
         int nextCountryId=maxCultures; // first maxCultures IDs reserved for seed countries
+
+        // ── CountryState map ──────────────────────────────────────────────────
+        // Keyed by countryId. Created when a country is first seen.
+        std::unordered_map<int,CountryState> countryStates;
+
+        // Helper: get-or-create a CountryState
+        auto getOrCreateState=[&](int cid, int cultId)->CountryState&{
+            auto it=countryStates.find(cid);
+            if(it!=countryStates.end()) return it->second;
+            CountryState& st=countryStates[cid];
+            st.countryId=cid;
+            st.cultureId=cultId;
+            st.alive=true;
+            // Randomise starting cultural attributes
+            std::mt19937 attrRng(settings.seed ^ uint32_t(cid)*2654435761u);
+            std::uniform_real_distribution<float> ad(0.1f,0.9f);
+            for(int a=0;a<CULT_ATTR_COUNT;++a) st.culturalAttrs[a]=ad(attrRng);
+            // Normalise so they sum to CULT_ATTR_COUNT (each averages 1.0)
+            float sum=0.f; for(float v:st.culturalAttrs) sum+=v;
+            if(sum>0.f) for(float& v:st.culturalAttrs) v=v/sum*CULT_ATTR_COUNT;
+            // Starting techs: Agriculture always, Mining if iron nearby, Sailing if coastal
+            st.techs[int(TechId::Agriculture)]=true;
+            return st;
+        };
+
+        // Initialise states for seed countries
+        for(int i=0;i<size*size;++i){
+            CivCell& c=result.civCells[i];
+            if(c.settled && c.countryId>=0)
+                getOrCreateState(c.countryId, c.cultureId);
+        }
+
+        // Tech cost table (science points required)
+        static const float techCost[TECH_COUNT]={
+            50.f,  // Agriculture
+            60.f,  // Mining
+            70.f,  // Sailing
+            120.f, // IronWorking
+            100.f, // Writing
+            110.f, // Masonry
+            130.f, // Navigation
+            200.f, // Mathematics
+            220.f, // Metallurgy
+            250.f, // Engineering
+            230.f, // Cartography
+            350.f, // Gunpowder
+            300.f, // Printing
+            400.f, // Arcane
+            320.f, // Astronomy
+        };
+
+        // Tech prerequisites
+        struct TechPrereq { TechId tech; TechId req1; TechId req2; bool needsResource; ResourceType resReq; };
+        static const TechPrereq techPrereqs[]={
+            {TechId::IronWorking, TechId::Mining,       TechId::Mining,       false, ResourceType::Iron},
+            {TechId::Writing,     TechId::Agriculture,  TechId::Agriculture,  false, ResourceType::Iron},
+            {TechId::Masonry,     TechId::Mining,       TechId::Mining,       false, ResourceType::Iron},
+            {TechId::Navigation,  TechId::Sailing,      TechId::Sailing,      false, ResourceType::Iron},
+            {TechId::Mathematics, TechId::Writing,      TechId::Writing,      false, ResourceType::Iron},
+            {TechId::Metallurgy,  TechId::IronWorking,  TechId::IronWorking,  false, ResourceType::Iron},
+            {TechId::Engineering, TechId::Masonry,      TechId::Mathematics,  false, ResourceType::Iron},
+            {TechId::Cartography, TechId::Navigation,   TechId::Writing,      false, ResourceType::Iron},
+            {TechId::Gunpowder,   TechId::Metallurgy,   TechId::Metallurgy,   true,  ResourceType::Niter},
+            {TechId::Printing,    TechId::Mathematics,  TechId::Mathematics,  false, ResourceType::Iron},
+            {TechId::Arcane,      TechId::Mathematics,  TechId::Mathematics,  true,  ResourceType::ManaStone},
+            {TechId::Astronomy,   TechId::Cartography,  TechId::Mathematics,  false, ResourceType::Iron},
+        };
+
+        // Helper: check if a country can research a tech
+        auto canResearch=[&](const CountryState& st, TechId tid)->bool{
+            if(st.techs[int(tid)]) return false; // already have it
+            for(auto& pr:techPrereqs){
+                if(pr.tech!=tid) continue;
+                if(!st.techs[int(pr.req1)]||!st.techs[int(pr.req2)]) return false;
+                if(pr.needsResource && st.stockpile[int(pr.resReq)]<1.f) return false;
+            }
+            return true;
+        };
+
+        // Helper: pick next research target for a country
+        auto pickResearch=[&](CountryState& st)->void{
+            if(st.currentResearch>=0 && !st.techs[st.currentResearch]) return; // still researching
+            // Find the cheapest available tech
+            float bestCost=1e9f; int bestTech=-1;
+            for(int t=0;t<TECH_COUNT;++t){
+                if(canResearch(st,TechId(t)) && techCost[t]<bestCost){
+                    bestCost=techCost[t]; bestTech=t;
+                }
+            }
+            st.currentResearch=bestTech;
+        };
 
         // ── Snapshot timing ───────────────────────────────────────────────────
         std::vector<int> civSnapTicks;
@@ -1536,7 +1732,218 @@ MapResult generateMap(const GeneratorSettings& settings)
                 }
             }
 
-            // ── 7. Snapshot capture ───────────────────────────────────────────
+            // ── 7. Per-country state update (science, resources, trade, research, merging) ──
+            if(tick%10==0){ // every 10 ticks to keep cost manageable
+                // First pass: collect per-country stats from cells
+                std::unordered_map<int,float> cntPop, cntSci, cntIncome;
+                std::unordered_map<int,std::array<float,RESOURCE_COUNT>> cntRes;
+                std::unordered_map<int,int> cntCult; // majority cultureId
+
+                for(int i=0;i<size*size;++i){
+                    const CivCell& c=result.civCells[i];
+                    if(!c.settled||c.countryId<0) continue;
+                    int cid=c.countryId;
+                    // Ensure state exists
+                    getOrCreateState(cid, c.cultureId);
+                    cntPop[cid]+=c.population;
+                    // Science: pop × scholarship attr × (1 + Writing/Mathematics bonus)
+                    cntSci[cid]+=c.population*0.01f;
+                    // Income: pop × mercantilism × (gold/silver/copper resources)
+                    float resIncome=c.resources[int(ResourceType::Gold)]*2.f
+                                   +c.resources[int(ResourceType::Silver)]*1.2f
+                                   +c.resources[int(ResourceType::Copper)]*0.8f;
+                    cntIncome[cid]+=c.population*0.005f+resIncome*0.1f;
+                    // Resource accumulation
+                    auto& ra=cntRes[cid];
+                    for(int r=0;r<RESOURCE_COUNT;++r)
+                        ra[r]+=c.resources[r]*0.1f;
+                    cntCult[cid]=c.cultureId; // last seen (good enough for majority)
+                }
+
+                // Second pass: update CountryState
+                for(auto& [cid,st]:countryStates){
+                    if(!st.alive) continue;
+                    auto popIt=cntPop.find(cid);
+                    if(popIt==cntPop.end()){ st.alive=false; continue; }
+
+                    // Cultural attribute drift: each attr drifts toward neighbours' average
+                    // (handled implicitly via conquest/merger; here we just add small noise)
+                    std::mt19937 driftRng(settings.seed ^ uint32_t(cid)*1234567u ^ uint32_t(tick)*987654u);
+                    std::uniform_real_distribution<float> drift(-0.01f,0.01f);
+                    for(int a=0;a<CULT_ATTR_COUNT;++a){
+                        st.culturalAttrs[a]=std::clamp(st.culturalAttrs[a]+drift(driftRng),0.05f,2.5f);
+                    }
+
+                    // Science rate: base + scholarship bonus + Writing/Mathematics tech bonus
+                    float scholBonus=st.culturalAttrs[int(CulturalAttr::Scholarship)];
+                    float techSciBonus=1.f;
+                    if(st.techs[int(TechId::Writing)])     techSciBonus+=0.3f;
+                    if(st.techs[int(TechId::Mathematics)]) techSciBonus+=0.5f;
+                    if(st.techs[int(TechId::Printing)])    techSciBonus+=0.8f;
+                    st.scienceRate=cntSci[cid]*scholBonus*techSciBonus;
+                    st.scienceAccum+=st.scienceRate;
+
+                    // Income: base + mercantilism bonus + trade tech bonus
+                    float mercBonus=st.culturalAttrs[int(CulturalAttr::Mercantilism)];
+                    float techTradeBonus=1.f;
+                    if(st.techs[int(TechId::Writing)])     techTradeBonus+=0.2f;
+                    if(st.techs[int(TechId::Cartography)]) techTradeBonus+=0.4f;
+                    if(st.techs[int(TechId::Navigation)])  techTradeBonus+=0.3f;
+                    st.income=cntIncome[cid]*mercBonus*techTradeBonus;
+
+                    // Resource stockpile accumulation (capped at 100 per type)
+                    auto& ra=cntRes[cid];
+                    for(int r=0;r<RESOURCE_COUNT;++r)
+                        st.stockpile[r]=std::min(st.stockpile[r]+ra[r],100.f);
+
+                    // Starting tech bonuses: unlock Mining if has Iron, Sailing if coastal
+                    if(!st.techs[int(TechId::Mining)] && st.stockpile[int(ResourceType::Iron)]>0.5f)
+                        st.techs[int(TechId::Mining)]=true;
+                    if(!st.techs[int(TechId::Sailing)] && st.stockpile[int(ResourceType::Copper)]>0.5f)
+                        st.techs[int(TechId::Sailing)]=true;
+
+                    // Research progression
+                    pickResearch(st);
+                    if(st.currentResearch>=0 && !st.techs[st.currentResearch]){
+                        float cost=techCost[st.currentResearch];
+                        if(st.scienceAccum>=cost){
+                            st.techs[st.currentResearch]=true;
+                            st.scienceAccum-=cost;
+                            // Log tech event
+                            CivEvent ev;
+                            ev.tick=tick; ev.type=EventType::TechUnlocked;
+                            ev.countryId=cid; ev.techId=st.currentResearch;
+                            ev.note=std::string("Country ")+std::to_string(cid)
+                                   +" unlocked "+techName(TechId(st.currentResearch));
+                            result.eventLog.push_back(ev);
+                            st.currentResearch=-1; // pick next
+                        }
+                    }
+
+                    // Tech cohesion bonus: Engineering and Navigation help hold empires together
+                    st.techCohesionBonus=0.f;
+                    if(st.techs[int(TechId::Engineering)]) st.techCohesionBonus+=0.05f;
+                    if(st.techs[int(TechId::Navigation)])  st.techCohesionBonus+=0.03f;
+                    if(st.techs[int(TechId::Cartography)]) st.techCohesionBonus+=0.02f;
+
+                    // Military strength
+                    float milAttr=st.culturalAttrs[int(CulturalAttr::Militarism)];
+                    float milTech=1.f;
+                    if(st.techs[int(TechId::IronWorking)]) milTech+=0.3f;
+                    if(st.techs[int(TechId::Metallurgy)])  milTech+=0.5f;
+                    if(st.techs[int(TechId::Gunpowder)])   milTech+=1.0f;
+                    st.militaryStr=popIt->second*milAttr*milTech*0.1f;
+                }
+
+                // ── Country merging via cultural similarity ────────────────────
+                // Every 50 ticks: check if two adjacent countries share the same
+                // cultureId AND both have high cohesion AND similar cultural attrs.
+                // If so, the smaller merges into the larger.
+                if(tick%50==0){
+                    // Build adjacency: which countries border which
+                    std::unordered_map<int,std::unordered_map<int,int>> adj; // [a][b] = shared border cells
+                    for(int y2=1;y2<size-1;++y2)
+                    for(int x2=0;x2<size;++x2){
+                        int i=y2*size+x2;
+                        const CivCell& c=result.civCells[i];
+                        if(!c.settled||c.countryId<0) continue;
+                        for(int d=0;d<4;++d){
+                            int nx2=((x2+ndx4[d])%size+size)%size;
+                            int ny2=std::clamp(y2+ndy4[d],0,size-1);
+                            int ni=ny2*size+nx2;
+                            const CivCell& nc=result.civCells[ni];
+                            if(nc.settled&&nc.countryId>=0&&nc.countryId!=c.countryId)
+                                adj[c.countryId][nc.countryId]++;
+                        }
+                    }
+
+                    // Count cells per country
+                    std::unordered_map<int,int> cellCount;
+                    for(int i=0;i<size*size;++i){
+                        const CivCell& c=result.civCells[i];
+                        if(c.settled&&c.countryId>=0) cellCount[c.countryId]++;
+                    }
+
+                    // Check each adjacent pair for merger eligibility
+                    std::vector<std::pair<int,int>> mergers; // (smaller, larger)
+                    for(auto& [a,nbrs]:adj){
+                        auto stA=countryStates.find(a);
+                        if(stA==countryStates.end()||!stA->second.alive) continue;
+                        for(auto& [b,borderLen]:nbrs){
+                            if(b<=a) continue; // avoid duplicates
+                            auto stB=countryStates.find(b);
+                            if(stB==countryStates.end()||!stB->second.alive) continue;
+
+                            // Must share same culture
+                            if(stA->second.cultureId!=stB->second.cultureId) continue;
+
+                            // Cultural similarity: dot product of normalised attr vectors
+                            float sim=0.f;
+                            for(int at=0;at<CULT_ATTR_COUNT;++at)
+                                sim+=stA->second.culturalAttrs[at]*stB->second.culturalAttrs[at];
+                            sim/=CULT_ATTR_COUNT; // normalised to ~1.0 if identical
+                            if(sim<0.8f) continue; // not similar enough
+
+                            // Both must have decent average cohesion
+                            // (use cellCount as proxy — small countries are more willing to merge)
+                            int sizeA=cellCount.count(a)?cellCount[a]:0;
+                            int sizeB=cellCount.count(b)?cellCount[b]:0;
+                            if(sizeA==0||sizeB==0) continue;
+
+                            // Merge smaller into larger
+                            int smaller=(sizeA<sizeB)?a:b;
+                            int larger =(sizeA<sizeB)?b:a;
+                            mergers.push_back({smaller,larger});
+                        }
+                    }
+
+                    // Apply mergers
+                    for(auto& [smaller,larger]:mergers){
+                        // Reassign all cells
+                        for(int i=0;i<size*size;++i){
+                            CivCell& c=result.civCells[i];
+                            if(c.countryId==smaller){
+                                c.countryId=larger;
+                                c.cohesion=std::max(c.cohesion,0.5f); // merger boosts cohesion
+                            }
+                        }
+                        // Mark smaller as dead
+                        auto it=countryStates.find(smaller);
+                        if(it!=countryStates.end()){
+                            // Transfer stockpiles
+                            auto& ls=countryStates[larger];
+                            for(int r=0;r<RESOURCE_COUNT;++r)
+                                ls.stockpile[r]=std::min(ls.stockpile[r]+it->second.stockpile[r],100.f);
+                            it->second.alive=false;
+                        }
+                        // Log merger event
+                        CivEvent ev;
+                        ev.tick=tick; ev.type=EventType::Merger;
+                        ev.countryId=larger; ev.countryId2=smaller;
+                        ev.note=std::string("Country ")+std::to_string(smaller)
+                               +" merged into "+std::to_string(larger);
+                        result.eventLog.push_back(ev);
+                    }
+                }
+
+                // ── Sea traversal: update effectiveTraversability ─────────────
+                // Countries with Navigation or Sailing tech can use sea routes.
+                // Coastal cells (seaAccess > 0.3) get a traversability bonus.
+                for(int i=0;i<size*size;++i){
+                    CivCell& c=result.civCells[i];
+                    if(!c.settled||c.countryId<0) continue;
+                    auto stIt=countryStates.find(c.countryId);
+                    float seaBonus=0.f;
+                    if(stIt!=countryStates.end()){
+                        const CountryState& st=stIt->second;
+                        if(st.techs[int(TechId::Sailing)])    seaBonus=c.seaAccess*0.2f;
+                        if(st.techs[int(TechId::Navigation)]) seaBonus=c.seaAccess*0.4f;
+                    }
+                    c.effectiveTraversability=std::clamp(c.traversability+seaBonus,0.f,1.f);
+                }
+            } // end tick%10 block
+
+            // ── 8. Snapshot capture ───────────────────────────────────────────
             for(int k=0;k<int(civSnapTicks.size());++k){
                 if(tick!=civSnapTicks[k]) continue;
 
@@ -1694,10 +2101,28 @@ MapResult generateMap(const GeneratorSettings& settings)
                     info.avgCohesion/=n;
                     info.avgCulture/=n;
                     info.avgTraversability/=n;
+                    // Copy extended stats from CountryState
+                    auto stIt=countryStates.find(id);
+                    if(stIt!=countryStates.end()){
+                        const CountryState& st=stIt->second;
+                        info.totalResources=st.stockpile;
+                        info.culturalAttrs=st.culturalAttrs;
+                        info.techs=st.techs;
+                        info.scienceRate=st.scienceRate;
+                        info.income=st.income;
+                        info.tradeVolume=st.tradeVolume;
+                    }
                     result.civInfos.push_back(info);
                 }
             }
         }
+
+        // ── Copy final CountryStates into result ──────────────────────────────
+        result.countryStates.clear();
+        result.countryStates.reserve(countryStates.size());
+        for(auto& [id,st]:countryStates)
+            if(st.alive) result.countryStates.push_back(st);
+
     } // end civ simulation block
 
     return result;
