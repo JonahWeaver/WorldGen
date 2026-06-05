@@ -90,7 +90,13 @@ enum class TechId : int
     Arcane        = 13,  // requires ManaStone resource + Mathematics
     Astronomy     = 14,  // requires Cartography + Mathematics
 
-    Count         = 15
+    // Tier 4 — Advanced
+    Colonialism   = 15,  // requires Navigation + Cartography: long-range sea expansion
+    Mountaineering= 16,  // requires Engineering + Metallurgy: mountain expansion
+    SiegeWarfare  = 17,  // requires Gunpowder + Engineering: siege bonus in conquest
+    Diplomacy     = 18,  // requires Printing + Mathematics: cheaper buyouts, better mergers
+
+    Count         = 19
 };
 
 static constexpr int TECH_COUNT = static_cast<int>(TechId::Count);
@@ -112,10 +118,67 @@ static const char* techName(TechId t)
         case TechId::Gunpowder:   return "Gunpowder";
         case TechId::Printing:    return "Printing";
         case TechId::Arcane:      return "Arcane Arts";
-        case TechId::Astronomy:   return "Astronomy";
-        default:                  return "Unknown";
+        case TechId::Astronomy:      return "Astronomy";
+        case TechId::Colonialism:    return "Colonialism";
+        case TechId::Mountaineering: return "Mountaineering";
+        case TechId::SiegeWarfare:   return "Siege Warfare";
+        case TechId::Diplomacy:      return "Diplomacy";
+        default:                     return "Unknown";
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GREAT PEOPLE
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum class GreatPersonType : int
+{
+    // Military great people (appear based on Iron/Copper/Niter stockpiles)
+    GreatWarrior  = 0,  // melee champion — boosted by Iron
+    GreatCommander= 1,  // tactical genius — boosted by Iron + Metallurgy tech
+    GreatAdmiral  = 2,  // naval hero — boosted by Navigation tech + Copper
+    GreatGunner   = 3,  // artillery master — boosted by Niter + Gunpowder tech
+
+    // Arcane great people (appear based on ManaStone stockpile + Arcane tech)
+    ArcaneMage    = 4,  // powerful battle mage
+    ArcaneScholar = 5,  // researcher — boosts science rate
+    ArcaneWarden  = 6,  // defensive ward — boosts cohesion
+    ArcaneHarbinger=7,  // rare legendary figure — massive military boost
+
+    Count         = 8
+};
+
+static constexpr int GREAT_PERSON_COUNT = static_cast<int>(GreatPersonType::Count);
+
+static const char* greatPersonName(GreatPersonType t)
+{
+    switch(t){
+        case GreatPersonType::GreatWarrior:    return "Great Warrior";
+        case GreatPersonType::GreatCommander:  return "Great Commander";
+        case GreatPersonType::GreatAdmiral:    return "Great Admiral";
+        case GreatPersonType::GreatGunner:     return "Great Gunner";
+        case GreatPersonType::ArcaneMage:      return "Arcane Mage";
+        case GreatPersonType::ArcaneScholar:   return "Arcane Scholar";
+        case GreatPersonType::ArcaneWarden:    return "Arcane Warden";
+        case GreatPersonType::ArcaneHarbinger: return "Arcane Harbinger";
+        default:                               return "Unknown";
+    }
+}
+
+static bool isArcaneGreatPerson(GreatPersonType t)
+{
+    return t >= GreatPersonType::ArcaneMage;
+}
+
+struct GreatPerson
+{
+    GreatPersonType type       = GreatPersonType::GreatWarrior;
+    int             countryId  = -1;
+    int             birthTick  = 0;
+    float           power      = 0.f;  // [0,1] relative strength of this individual
+    bool            alive      = true;
+    std::string     name;              // generated name (optional)
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EVENT LOG
@@ -123,13 +186,14 @@ static const char* techName(TechId t)
 
 enum class EventType : int
 {
-    Founded      = 0,  // country founded / settlement established
-    Conquest     = 1,  // country conquered a region
-    Secession    = 2,  // region broke away
-    Merger       = 3,  // two countries merged
-    TechUnlocked = 4,  // technology researched
-    CityFounded  = 5,  // city reached city-level population
-    Collapse     = 6,  // country lost all territory
+    Founded         = 0,  // country founded / settlement established
+    Conquest        = 1,  // country conquered a region
+    Secession       = 2,  // region broke away
+    Merger          = 3,  // two countries merged
+    TechUnlocked    = 4,  // technology researched
+    CityFounded     = 5,  // city reached city-level population
+    Collapse        = 6,  // country lost all territory
+    GreatPersonBorn = 7,  // a great person appeared
 };
 
 struct CivEvent
@@ -198,10 +262,22 @@ struct CountryState
     float income      = 0.f;   // gold income this tick
     float scienceRate = 0.f;   // science generated this tick
     float tradeVolume = 0.f;   // total trade with neighbours this tick
-    float militaryStr = 0.f;   // military strength (pop × militarism × tech bonus)
 
-    // Cohesion bonus from technology (Navigation, Engineering, etc.)
+    // Military
+    float militaryStr    = 0.f;  // total land military strength
+    float navyStr        = 0.f;  // naval strength (0 until Navigation tech)
+    float swordsmenStr   = 0.f;  // Iron-based melee component
+    float gunmenStr      = 0.f;  // Niter-based ranged/gunpowder component
+    float arcaneStr      = 0.f;  // ManaStone-based arcane component
+    float greatPersonMilBonus = 0.f; // bonus from active great people
+
+    // Cohesion bonus from technology (Navigation, Engineering, Printing, etc.)
     float techCohesionBonus = 0.f;
+
+    // Great people
+    std::vector<GreatPerson> greatPeople;  // all great people ever born to this country
+    float greatPersonAccum = 0.f;          // accumulated "great person points"
+    float arcaneAccum      = 0.f;          // accumulated arcane great person points
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -230,6 +306,18 @@ struct CivInfo
     float scienceRate  = 0.f;
     float tradeVolume  = 0.f;
     float income       = 0.f;
+
+    // Military
+    float militaryStr  = 0.f;
+    float navyStr      = 0.f;
+    float swordsmenStr = 0.f;
+    float gunmenStr    = 0.f;
+    float arcaneStr    = 0.f;
+
+    // Great people (copy of alive great people at snapshot time)
+    std::vector<GreatPerson> greatPeople;
+    int greatPersonTotal = 0;   // total ever born
+    int arcanePersonTotal= 0;   // total arcane great people ever born
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

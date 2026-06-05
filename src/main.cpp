@@ -506,6 +506,38 @@ int main()
                 }
                 if(techsShown==0) ImGui::TextDisabled("  (none yet)");
 
+                // Military
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(1.f,0.4f,0.4f,1.f), "Military");
+                ImGui::Text("Total Strength : %.1f", info->militaryStr);
+                ImGui::Text("  Swordsmen    : %.1f  (Iron + tech)", info->swordsmenStr);
+                ImGui::Text("  Gunmen       : %.1f  (Niter + Gunpowder)", info->gunmenStr);
+                ImGui::Text("  Arcane       : %.1f  (ManaStone + Arcane)", info->arcaneStr);
+                if(info->navyStr > 0.01f)
+                    ImGui::Text("Navy Strength  : %.1f  (Copper + Navigation)", info->navyStr);
+                else
+                    ImGui::TextDisabled("Navy: none (needs Navigation tech)");
+
+                // Great People
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(1.f,0.6f,1.f,1.f), "Great People");
+                ImGui::Text("Total born: %d  (Arcane: %d)",
+                            info->greatPersonTotal, info->arcanePersonTotal);
+                if(info->greatPeople.empty()){
+                    ImGui::TextDisabled("  (none active)");
+                } else {
+                    for(const GreatPerson& gp : info->greatPeople){
+                        bool isArcane = isArcaneGreatPerson(gp.type);
+                        ImVec4 gpCol = isArcane
+                            ? ImVec4(1.f,0.5f,1.f,1.f)   // arcane: magenta
+                            : ImVec4(1.f,0.8f,0.3f,1.f);  // military: gold
+                        ImGui::TextColored(gpCol, "  [T%d] %s  (power %d%%)",
+                            gp.birthTick,
+                            greatPersonName(gp.type),
+                            int(gp.power*100));
+                    }
+                }
+
                 ImGui::Separator();
                 if (ImGui::Button("Close", ImVec2(-1, 0))) showCivPopup = false;
 
@@ -525,7 +557,7 @@ int main()
             ImGui::Begin("Event Log", &showEventLog);
 
             static const char* evTypeNames[] = {
-                "Founded","Conquest","Secession","Merger","Tech","City","Collapse"};
+                "Founded","Conquest","Secession","Merger","Tech","City","Collapse","GreatPerson"};
             static const ImVec4 evTypeColors[] = {
                 ImVec4(0.5f,1.f,0.5f,1.f),   // Founded: green
                 ImVec4(1.f,0.4f,0.4f,1.f),   // Conquest: red
@@ -534,6 +566,7 @@ int main()
                 ImVec4(0.9f,0.6f,1.f,1.f),   // Tech: purple
                 ImVec4(1.f,1.f,0.5f,1.f),    // City: pale yellow
                 ImVec4(0.6f,0.6f,0.6f,1.f),  // Collapse: grey
+                ImVec4(1.f,0.5f,1.f,1.f),    // GreatPerson: bright magenta
             };
 
             // Filter controls
@@ -541,7 +574,7 @@ int main()
             ImGui::Text("Filter:");
             ImGui::SameLine();
             if (ImGui::SmallButton("All")) filterType = -1;
-            for (int t = 0; t < 7; ++t) {
+            for (int t = 0; t < 8; ++t) {
                 ImGui::SameLine();
                 if (ImGui::SmallButton(evTypeNames[t])) filterType = t;
             }
@@ -672,8 +705,10 @@ int main()
                 activeCivSnap = std::clamp(activeCivSnap, 0, civMax);
             }
             const CivSnapshot& cs = map.civSnaps[activeCivSnap];
-            ImGui::Text("  Tick %d  |  Pop %.0f  |  Settled %d  |  Cultures %d",
-                        cs.tick, cs.totalPop, cs.settledCells, cs.cultureGroups);
+            ImGui::Text("  Tick %d  |  Pop %.0f  |  Settled %d",
+                        cs.tick, cs.totalPop, cs.settledCells);
+            ImGui::Text("  Countries %d  |  Cultures %d",
+                        cs.countryCount, cs.cultureGroups);
 
             // Quick-jump buttons
             ImGui::Text("Jump to:");
@@ -725,6 +760,65 @@ int main()
             ImGui::SliderFloat("Coh Lerp Rate",  &settings.cohesionLerpRate, 0.01f, 0.3f, "%.3f");
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("How fast cohesion changes per tick.\nLow = slow, gradual fragmentation\nHigh = rapid, dramatic splits");
+
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.f,0.6f,1.f,1.f), "Great People");
+
+            ImGui::TextColored(ImVec4(1.f,0.8f,0.3f,1.f), "Military Great People");
+            ImGui::SliderFloat("Mil GP Frequency", &settings.gpMilFrequency, 0.f, 3.f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Multiplier on military great person spawn rate.\n0 = never  1 = default  2 = double rate\nAppear based on pop × militarism × Iron/Niter/Copper");
+            ImGui::SliderFloat("Mil GP Power Min", &settings.gpMilPowerMin, 0.f, 1.f, "%.2f");
+            ImGui::SliderFloat("Mil GP Power Max", &settings.gpMilPowerMax, 0.f, 1.f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Power range for military great people.\nPower scales their military strength bonus.");
+
+            ImGui::TextColored(ImVec4(1.f,0.5f,1.f,1.f), "Arcane Great People");
+            ImGui::SliderFloat("Arc GP Frequency", &settings.gpArcaneFrequency, 0.f, 3.f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Multiplier on arcane great person spawn rate.\nRequires Arcane tech + ManaStone stockpile.\nRarer than military great people by default.");
+            ImGui::SliderFloat("Arc GP Power Min", &settings.gpArcanePowerMin, 0.f, 1.f, "%.2f");
+            ImGui::SliderFloat("Arc GP Power Max", &settings.gpArcanePowerMax, 0.f, 1.f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Power range for arcane great people.\nArcane Harbinger always gets max power.");
+            ImGui::SliderFloat("Harbinger Chance", &settings.gpHarbingerChance, 0.f, 0.5f, "%.3f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Probability that an arcane great person is a Harbinger.\nHarbingers are legendary figures with massive military power.\nDefault: 5% (very rare)");
+
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.4f,1.f,0.8f,1.f), "Diplomacy / Buyout");
+
+            ImGui::SliderFloat("Iso Buyout Block", &settings.isolationismBuyoutBlock, 0.05f, 2.5f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Isolationism value at or above which Gold buyout is impossible.\n"
+                                  "Default 0.5 — most isolationist civs resist buyout.\n"
+                                  "Set to 2.5 to allow buying even very isolationist civs.\n"
+                                  "Highly isolationist civs can only be taken by conquest.");
+
+            ImGui::SliderFloat("Iso Price Scale", &settings.isolationismPriceScale, 0.f, 5.f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How much each point of Isolationism inflates the buyout price.\n"
+                                  "price *= (1 + Isolationism × scale)\n"
+                                  "Default 1.5 — each point adds 150% to the base price.");
+
+            ImGui::SliderFloat("Cult Sim Discount", &settings.culturalSimMaxDiscount, 0.f, 1.f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Maximum Gold discount from cultural similarity [0,1].\n"
+                                  "0 = no cultural discount\n"
+                                  "0.5 = identical cultures pay 50% less (default)\n"
+                                  "1.0 = identical cultures pay nothing");
+
+            ImGui::SliderFloat("Diplomacy Discount", &settings.diplomacyTechDiscount, 0.f, 0.9f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Additional Gold discount when buyer has Diplomacy tech.\n"
+                                  "Default 0.30 (30% off).\n"
+                                  "Stacks multiplicatively with cultural similarity discount.");
+
+            ImGui::SliderFloat("Buyout Coh Cap", &settings.buyoutCohesionCap, 0.1f, 1.f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Target's average cohesion must be below this to accept buyout.\n"
+                                  "Default 0.65 — only fragile/unstable countries can be bought.\n"
+                                  "Set higher to allow buying stable countries (at great cost).");
         }
 
         if (ImGui::Button("Generate", ImVec2(-1, 0)))

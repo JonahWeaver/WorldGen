@@ -1422,23 +1422,31 @@ MapResult generateMap(const GeneratorSettings& settings)
             300.f, // Printing
             400.f, // Arcane
             320.f, // Astronomy
+            500.f, // Colonialism
+            480.f, // Mountaineering
+            450.f, // SiegeWarfare
+            420.f, // Diplomacy
         };
 
         // Tech prerequisites
         struct TechPrereq { TechId tech; TechId req1; TechId req2; bool needsResource; ResourceType resReq; };
         static const TechPrereq techPrereqs[]={
-            {TechId::IronWorking, TechId::Mining,       TechId::Mining,       false, ResourceType::Iron},
-            {TechId::Writing,     TechId::Agriculture,  TechId::Agriculture,  false, ResourceType::Iron},
-            {TechId::Masonry,     TechId::Mining,       TechId::Mining,       false, ResourceType::Iron},
-            {TechId::Navigation,  TechId::Sailing,      TechId::Sailing,      false, ResourceType::Iron},
-            {TechId::Mathematics, TechId::Writing,      TechId::Writing,      false, ResourceType::Iron},
-            {TechId::Metallurgy,  TechId::IronWorking,  TechId::IronWorking,  false, ResourceType::Iron},
-            {TechId::Engineering, TechId::Masonry,      TechId::Mathematics,  false, ResourceType::Iron},
-            {TechId::Cartography, TechId::Navigation,   TechId::Writing,      false, ResourceType::Iron},
-            {TechId::Gunpowder,   TechId::Metallurgy,   TechId::Metallurgy,   true,  ResourceType::Niter},
-            {TechId::Printing,    TechId::Mathematics,  TechId::Mathematics,  false, ResourceType::Iron},
-            {TechId::Arcane,      TechId::Mathematics,  TechId::Mathematics,  true,  ResourceType::ManaStone},
-            {TechId::Astronomy,   TechId::Cartography,  TechId::Mathematics,  false, ResourceType::Iron},
+            {TechId::IronWorking,    TechId::Mining,       TechId::Mining,       false, ResourceType::Iron},
+            {TechId::Writing,        TechId::Agriculture,  TechId::Agriculture,  false, ResourceType::Iron},
+            {TechId::Masonry,        TechId::Mining,       TechId::Mining,       false, ResourceType::Iron},
+            {TechId::Navigation,     TechId::Sailing,      TechId::Sailing,      false, ResourceType::Iron},
+            {TechId::Mathematics,    TechId::Writing,      TechId::Writing,      false, ResourceType::Iron},
+            {TechId::Metallurgy,     TechId::IronWorking,  TechId::IronWorking,  false, ResourceType::Iron},
+            {TechId::Engineering,    TechId::Masonry,      TechId::Mathematics,  false, ResourceType::Iron},
+            {TechId::Cartography,    TechId::Navigation,   TechId::Writing,      false, ResourceType::Iron},
+            {TechId::Gunpowder,      TechId::Metallurgy,   TechId::Metallurgy,   true,  ResourceType::Niter},
+            {TechId::Printing,       TechId::Mathematics,  TechId::Mathematics,  false, ResourceType::Iron},
+            {TechId::Arcane,         TechId::Mathematics,  TechId::Mathematics,  true,  ResourceType::ManaStone},
+            {TechId::Astronomy,      TechId::Cartography,  TechId::Mathematics,  false, ResourceType::Iron},
+            {TechId::Colonialism,    TechId::Navigation,   TechId::Cartography,  false, ResourceType::Iron},
+            {TechId::Mountaineering, TechId::Engineering,  TechId::Metallurgy,   false, ResourceType::Iron},
+            {TechId::SiegeWarfare,   TechId::Gunpowder,    TechId::Engineering,  false, ResourceType::Iron},
+            {TechId::Diplomacy,      TechId::Printing,     TechId::Mathematics,  false, ResourceType::Iron},
         };
 
         // Helper: check if a country can research a tech
@@ -1635,16 +1643,31 @@ MapResult generateMap(const GeneratorSettings& settings)
                         capital[c.countryId]=i;
                     }
                 }
-                // BFS from all capitals simultaneously
-                std::vector<int> dist(size*size, -1);
-                std::vector<int> bfsQ;
-                bfsQ.reserve(size*size/4);
+                // Traversability-weighted Dijkstra from all capitals simultaneously.
+                // "Distance" is accumulated traversal cost: crossing a low-traversability
+                // cell (mountain, dense forest) costs more than crossing flat plains.
+                // This means borders follow natural barriers (mountains, forests, rivers)
+                // rather than being perfectly circular rings around the capital.
+                //
+                // Cost to cross cell i = 1.0 / (effectiveTraversability[i] + 0.05)
+                // So a flat plain (trav=0.9) costs ~1.05, a mountain (trav=0.1) costs ~6.7.
+                // The halfLife is in "traversal cost units" rather than raw cell count.
+                std::vector<float> travDist(size*size, 1e9f);
+                // Priority queue: (cost, cellIndex)
+                // Use a simple sorted vector for small maps; for large maps this is O(n log n).
+                using PQEntry = std::pair<float,int>;
+                std::vector<PQEntry> pq;
+                pq.reserve(size*size/8);
                 for(auto& [cid,capCell]:capital){
-                    dist[capCell]=0;
-                    bfsQ.push_back(capCell);
+                    travDist[capCell]=0.f;
+                    pq.push_back({0.f, capCell});
                 }
-                for(int qi=0;qi<int(bfsQ.size());++qi){
-                    int cur=bfsQ[qi];
+                std::make_heap(pq.begin(),pq.end(),[](const PQEntry& a,const PQEntry& b){return a.first>b.first;});
+                while(!pq.empty()){
+                    auto [cost,cur]=pq.front();
+                    std::pop_heap(pq.begin(),pq.end(),[](const PQEntry& a,const PQEntry& b){return a.first>b.first;});
+                    pq.pop_back();
+                    if(cost>travDist[cur]) continue; // stale entry
                     int cy=cur/size, cx=cur%size;
                     int cid=result.civCells[cur].countryId;
                     for(int d=0;d<4;++d){
@@ -1652,23 +1675,26 @@ MapResult generateMap(const GeneratorSettings& settings)
                         int ny2=std::clamp(cy+ndy4[d],0,size-1);
                         int ni=ny2*size+nx2;
                         CivCell& nc=result.civCells[ni];
-                        if(dist[ni]<0&&nc.settled&&nc.countryId==cid){
-                            dist[ni]=dist[cur]+1;
-                            bfsQ.push_back(ni);
+                        if(!nc.settled||nc.countryId!=cid) continue;
+                        // Cost = inverse of effective traversability (mountains are expensive)
+                        float stepCost=1.f/(nc.effectiveTraversability+0.05f);
+                        float newCost=cost+stepCost;
+                        if(newCost<travDist[ni]){
+                            travDist[ni]=newCost;
+                            pq.push_back({newCost,ni});
+                            std::push_heap(pq.begin(),pq.end(),[](const PQEntry& a,const PQEntry& b){return a.first>b.first;});
                         }
                     }
                 }
-                // Clamp cohesion to exponential distance ceiling.
-                // halfLife = size/4: cohesion halves every size/4 cells from capital.
-                // At distance size/4:  cap = 0.37  (fragile but survivable)
-                // At distance size/2:  cap = 0.14  (will secede soon)
-                // At distance size*1:  cap = 0.02  (guaranteed secession)
-                // This is gentler than size/8, allowing larger stable empires.
+                // Clamp cohesion to exponential traversal-distance ceiling.
+                // halfLife is in traversal-cost units (not raw cells).
+                // A flat empire (all trav=0.9) has effective halfLife ≈ cohHalfLife cells.
+                // A mountainous empire has a much shorter effective reach.
                 float halfLife=cohHalfLife;
                 for(int i=0;i<size*size;++i){
                     CivCell& c=result.civCells[i];
                     if(!c.settled||c.countryId<0) continue;
-                    float d=float(dist[i]<0?int(halfLife*4):dist[i]);
+                    float d=travDist[i]<1e8f ? travDist[i] : halfLife*4.f;
                     float cap2=std::exp(-d/halfLife);
                     c.cohesion=std::min(c.cohesion, cap2);
                 }
@@ -1791,10 +1817,10 @@ MapResult generateMap(const GeneratorSettings& settings)
                     if(st.techs[int(TechId::Navigation)])  techTradeBonus+=0.3f;
                     st.income=cntIncome[cid]*mercBonus*techTradeBonus;
 
-                    // Resource stockpile accumulation (capped at 100 per type)
+                    // Resource stockpile accumulation (capped at 10,000 per type)
                     auto& ra=cntRes[cid];
                     for(int r=0;r<RESOURCE_COUNT;++r)
-                        st.stockpile[r]=std::min(st.stockpile[r]+ra[r],100.f);
+                        st.stockpile[r]=std::min(st.stockpile[r]+ra[r],10000.f);
 
                     // Starting tech bonuses: unlock Mining if has Iron, Sailing if coastal
                     if(!st.techs[int(TechId::Mining)] && st.stockpile[int(ResourceType::Iron)]>0.5f)
@@ -1820,28 +1846,186 @@ MapResult generateMap(const GeneratorSettings& settings)
                         }
                     }
 
-                    // Tech cohesion bonus: Engineering and Navigation help hold empires together
+            // Tech cohesion bonus: multiple techs help hold empires together
                     st.techCohesionBonus=0.f;
                     if(st.techs[int(TechId::Engineering)]) st.techCohesionBonus+=0.05f;
                     if(st.techs[int(TechId::Navigation)])  st.techCohesionBonus+=0.03f;
                     if(st.techs[int(TechId::Cartography)]) st.techCohesionBonus+=0.02f;
+                    if(st.techs[int(TechId::Printing)])    st.techCohesionBonus+=0.08f; // Printing Press: major cohesion boost
+                    if(st.techs[int(TechId::Masonry)])     st.techCohesionBonus+=0.02f;
+                    if(st.techs[int(TechId::Writing)])     st.techCohesionBonus+=0.01f;
 
-                    // Military strength
+                    // Apply tech cohesion bonus to all cells of this country
+                    // (done here so it feeds into the cohesion ceiling in step 4)
+                    if(st.techCohesionBonus>0.f){
+                        for(int i=0;i<size*size;++i){
+                            CivCell& c=result.civCells[i];
+                            if(c.countryId==cid && c.settled)
+                                c.cohesion=std::min(c.cohesion+st.techCohesionBonus*0.01f,1.f);
+                        }
+                    }
+
+                    // ── Military calculation ──────────────────────────────────
                     float milAttr=st.culturalAttrs[int(CulturalAttr::Militarism)];
-                    float milTech=1.f;
-                    if(st.techs[int(TechId::IronWorking)]) milTech+=0.3f;
-                    if(st.techs[int(TechId::Metallurgy)])  milTech+=0.5f;
-                    if(st.techs[int(TechId::Gunpowder)])   milTech+=1.0f;
-                    st.militaryStr=popIt->second*milAttr*milTech*0.1f;
+                    float pop=popIt->second;
+
+                    // Swordsmen: Iron-based melee (base + IronWorking + Metallurgy)
+                    float ironFactor=std::clamp(st.stockpile[int(ResourceType::Iron)]/20.f,0.f,1.f);
+                    float swordTech=1.f;
+                    if(st.techs[int(TechId::IronWorking)]) swordTech+=0.4f;
+                    if(st.techs[int(TechId::Metallurgy)])  swordTech+=0.6f;
+                    st.swordsmenStr=pop*milAttr*ironFactor*swordTech*0.08f;
+
+                    // Gunmen: Niter-based ranged (requires Gunpowder tech)
+                    float niterFactor=std::clamp(st.stockpile[int(ResourceType::Niter)]/15.f,0.f,1.f);
+                    st.gunmenStr=0.f;
+                    if(st.techs[int(TechId::Gunpowder)])
+                        st.gunmenStr=pop*milAttr*niterFactor*1.5f*0.08f;
+
+                    // Arcane military: ManaStone-based (requires Arcane tech)
+                    float manaFactor=std::clamp(st.stockpile[int(ResourceType::ManaStone)]/10.f,0.f,1.f);
+                    st.arcaneStr=0.f;
+                    if(st.techs[int(TechId::Arcane)])
+                        st.arcaneStr=pop*milAttr*manaFactor*2.0f*0.08f;
+
+                    // Great person military bonus (sum of alive great people's power)
+                    st.greatPersonMilBonus=0.f;
+                    for(const GreatPerson& gp:st.greatPeople){
+                        if(!gp.alive) continue;
+                        switch(gp.type){
+                            case GreatPersonType::GreatWarrior:
+                            case GreatPersonType::GreatCommander:
+                            case GreatPersonType::GreatGunner:
+                            case GreatPersonType::ArcaneMage:
+                            case GreatPersonType::ArcaneHarbinger:
+                                st.greatPersonMilBonus+=gp.power*pop*0.05f;
+                                break;
+                            default: break;
+                        }
+                    }
+
+                    // Navy: requires Navigation tech; boosted by Copper + Cartography
+                    st.navyStr=0.f;
+                    if(st.techs[int(TechId::Navigation)]){
+                        float copperFactor=std::clamp(st.stockpile[int(ResourceType::Copper)]/15.f,0.f,1.f);
+                        float navyTech=1.f;
+                        if(st.techs[int(TechId::Cartography)]) navyTech+=0.5f;
+                        if(st.techs[int(TechId::Astronomy)])   navyTech+=0.3f;
+                        st.navyStr=pop*milAttr*copperFactor*navyTech*0.06f;
+                    }
+
+                    // Total military = swordsmen + gunmen + arcane + great person bonus
+                    st.militaryStr=st.swordsmenStr+st.gunmenStr+st.arcaneStr+st.greatPersonMilBonus;
+                    // Fallback: if no resources, still have a base militia
+                    if(st.militaryStr<pop*milAttr*0.01f)
+                        st.militaryStr=pop*milAttr*0.01f;
+
+                    // ── Great Person spawning ─────────────────────────────────
+                    // Military GP: accumulate points from pop × militarism × resource bonus
+                    // Threshold: 500 points → spawn one military GP
+                    {
+                        float milGpRate=pop*milAttr*0.002f*settings.gpMilFrequency;
+                        // Resource bonuses: Iron, Niter, Copper each contribute
+                        milGpRate*=(1.f+ironFactor*0.5f+niterFactor*0.3f
+                                   +std::clamp(st.stockpile[int(ResourceType::Copper)]/15.f,0.f,1.f)*0.2f);
+                        st.greatPersonAccum+=milGpRate;
+
+                        const float milGpThreshold=500.f;
+                        if(st.greatPersonAccum>=milGpThreshold){
+                            st.greatPersonAccum-=milGpThreshold;
+
+                            // Pick which type of military GP to spawn
+                            GreatPersonType gpType=GreatPersonType::GreatWarrior;
+                            std::mt19937 gpRng(settings.seed^uint32_t(cid)*777u^uint32_t(tick)*333u);
+                            std::uniform_real_distribution<float> gpd(0.f,1.f);
+                            float r=gpd(gpRng);
+                            if(st.techs[int(TechId::Gunpowder)] && niterFactor>0.2f && r<0.30f)
+                                gpType=GreatPersonType::GreatGunner;
+                            else if(st.techs[int(TechId::Navigation)] && r<0.20f)
+                                gpType=GreatPersonType::GreatAdmiral;
+                            else if(st.techs[int(TechId::Metallurgy)] && r<0.50f)
+                                gpType=GreatPersonType::GreatCommander;
+                            // else GreatWarrior
+
+                            float power=settings.gpMilPowerMin
+                                       +gpd(gpRng)*(settings.gpMilPowerMax-settings.gpMilPowerMin);
+                            GreatPerson gp;
+                            gp.type=gpType; gp.countryId=cid;
+                            gp.birthTick=tick; gp.power=power; gp.alive=true;
+                            st.greatPeople.push_back(gp);
+
+                            CivEvent ev;
+                            ev.tick=tick; ev.type=EventType::GreatPersonBorn;
+                            ev.countryId=cid;
+                            ev.note=std::string("Country ")+std::to_string(cid)
+                                   +" — "+greatPersonName(gpType)
+                                   +" (power "+std::to_string(int(power*100))+")";
+                            result.eventLog.push_back(ev);
+                        }
+                    }
+
+                    // Arcane GP: accumulate from ManaStone × Arcane tech
+                    if(st.techs[int(TechId::Arcane)]){
+                        float arcGpRate=manaFactor*pop*0.001f*settings.gpArcaneFrequency;
+                        st.arcaneAccum+=arcGpRate;
+
+                        const float arcGpThreshold=800.f; // rarer than military
+                        if(st.arcaneAccum>=arcGpThreshold){
+                            st.arcaneAccum-=arcGpThreshold;
+
+                            std::mt19937 agpRng(settings.seed^uint32_t(cid)*999u^uint32_t(tick)*555u);
+                            std::uniform_real_distribution<float> agpd(0.f,1.f);
+
+                            GreatPersonType gpType;
+                            float r=agpd(agpRng);
+                            if(r<settings.gpHarbingerChance)
+                                gpType=GreatPersonType::ArcaneHarbinger;
+                            else if(r<settings.gpHarbingerChance+0.25f)
+                                gpType=GreatPersonType::ArcaneScholar;
+                            else if(r<settings.gpHarbingerChance+0.50f)
+                                gpType=GreatPersonType::ArcaneWarden;
+                            else
+                                gpType=GreatPersonType::ArcaneMage;
+
+                            float power=settings.gpArcanePowerMin
+                                       +agpd(agpRng)*(settings.gpArcanePowerMax-settings.gpArcanePowerMin);
+                            // Harbinger always gets max power
+                            if(gpType==GreatPersonType::ArcaneHarbinger)
+                                power=std::max(power,0.85f);
+
+                            GreatPerson gp;
+                            gp.type=gpType; gp.countryId=cid;
+                            gp.birthTick=tick; gp.power=power; gp.alive=true;
+                            st.greatPeople.push_back(gp);
+
+                            // ArcaneScholar boosts science
+                            if(gpType==GreatPersonType::ArcaneScholar)
+                                st.scienceAccum+=power*200.f;
+                            // ArcaneWarden boosts cohesion of all cells
+                            if(gpType==GreatPersonType::ArcaneWarden){
+                                for(int i=0;i<size*size;++i){
+                                    CivCell& c=result.civCells[i];
+                                    if(c.countryId==cid && c.settled)
+                                        c.cohesion=std::min(c.cohesion+power*0.1f,1.f);
+                                }
+                            }
+
+                            CivEvent ev;
+                            ev.tick=tick; ev.type=EventType::GreatPersonBorn;
+                            ev.countryId=cid;
+                            ev.note=std::string("Country ")+std::to_string(cid)
+                                   +" — "+greatPersonName(gpType)
+                                   +" (power "+std::to_string(int(power*100))+")";
+                            result.eventLog.push_back(ev);
+                        }
+                    }
                 }
 
-                // ── Country merging via cultural similarity ────────────────────
-                // Every 50 ticks: check if two adjacent countries share the same
-                // cultureId AND both have high cohesion AND similar cultural attrs.
-                // If so, the smaller merges into the larger.
-                if(tick%50==0){
-                    // Build adjacency: which countries border which
-                    std::unordered_map<int,std::unordered_map<int,int>> adj; // [a][b] = shared border cells
+                // ── Country merging & conquest (every 20 ticks) ───────────────
+                if(tick%20==0){
+                    // ── Build shared data structures ──────────────────────────
+                    // Adjacency: adj[a][b] = number of shared border cells
+                    std::unordered_map<int,std::unordered_map<int,int>> adj;
                     for(int y2=1;y2<size-1;++y2)
                     for(int x2=0;x2<size;++x2){
                         int i=y2*size+x2;
@@ -1857,89 +2041,561 @@ MapResult generateMap(const GeneratorSettings& settings)
                         }
                     }
 
-                    // Count cells per country
+                    // Cell count per country
                     std::unordered_map<int,int> cellCount;
                     for(int i=0;i<size*size;++i){
                         const CivCell& c=result.civCells[i];
                         if(c.settled&&c.countryId>=0) cellCount[c.countryId]++;
                     }
 
-                    // Check each adjacent pair for merger eligibility
-                    std::vector<std::pair<int,int>> mergers; // (smaller, larger)
-                    for(auto& [a,nbrs]:adj){
-                        auto stA=countryStates.find(a);
-                        if(stA==countryStates.end()||!stA->second.alive) continue;
-                        for(auto& [b,borderLen]:nbrs){
-                            if(b<=a) continue; // avoid duplicates
-                            auto stB=countryStates.find(b);
-                            if(stB==countryStates.end()||!stB->second.alive) continue;
+                    // Helper: transfer all cells from src → dst, transfer stockpiles, mark dead
+                    auto absorbCountry=[&](int src, int dst, const std::string& reason){
+                        for(int i=0;i<size*size;++i){
+                            CivCell& c=result.civCells[i];
+                            if(c.countryId==src){
+                                c.countryId=dst;
+                                c.cohesion=std::max(c.cohesion,0.45f);
+                            }
+                        }
+                        auto it=countryStates.find(src);
+                        if(it!=countryStates.end()){
+                            auto& ls=countryStates[dst];
+                            for(int r=0;r<RESOURCE_COUNT;++r)
+                                ls.stockpile[r]=std::min(ls.stockpile[r]+it->second.stockpile[r],10000.f);
+                            it->second.alive=false;
+                        }
+                        CivEvent ev;
+                        ev.tick=tick; ev.type=EventType::Merger;
+                        ev.countryId=dst; ev.countryId2=src;
+                        ev.note=reason;
+                        result.eventLog.push_back(ev);
+                    };
 
-                            // Must share same culture
-                            if(stA->second.cultureId!=stB->second.cultureId) continue;
+                    // Helper: transfer a fraction of src's border cells to dst
+                    // fraction: 0.33=one third, 0.67=two thirds, 1.0=all
+                    auto transferBorderCells=[&](int src, int dst, float fraction){
+                        // Collect border cells of src that touch dst
+                        std::vector<int> borderCells;
+                        for(int y2=1;y2<size-1;++y2)
+                        for(int x2=0;x2<size;++x2){
+                            int i=y2*size+x2;
+                            if(result.civCells[i].countryId!=src) continue;
+                            bool touchesDst=false;
+                            for(int d=0;d<4;++d){
+                                int nx2=((x2+ndx4[d])%size+size)%size;
+                                int ny2=std::clamp(y2+ndy4[d],0,size-1);
+                                if(result.civCells[ny2*size+nx2].countryId==dst){touchesDst=true;break;}
+                            }
+                            if(touchesDst) borderCells.push_back(i);
+                        }
+                        int n=int(borderCells.size()*fraction);
+                        for(int k=0;k<n;++k){
+                            result.civCells[borderCells[k]].countryId=dst;
+                            result.civCells[borderCells[k]].cohesion=0.35f;
+                        }
+                    };
 
-                            // Cultural similarity: dot product of normalised attr vectors
-                            float sim=0.f;
-                            for(int at=0;at<CULT_ATTR_COUNT;++at)
-                                sim+=stA->second.culturalAttrs[at]*stB->second.culturalAttrs[at];
-                            sim/=CULT_ATTR_COUNT; // normalised to ~1.0 if identical
-                            if(sim<0.8f) continue; // not similar enough
-
-                            // Both must have decent average cohesion
-                            // (use cellCount as proxy — small countries are more willing to merge)
-                            int sizeA=cellCount.count(a)?cellCount[a]:0;
-                            int sizeB=cellCount.count(b)?cellCount[b]:0;
-                            if(sizeA==0||sizeB==0) continue;
-
-                            // Merge smaller into larger
-                            int smaller=(sizeA<sizeB)?a:b;
-                            int larger =(sizeA<sizeB)?b:a;
-                            mergers.push_back({smaller,larger});
+                    // ── A. Voluntary merger (cultural similarity) ─────────────
+                    // Same culture + similar cultural attr vector → smaller absorbed by larger
+                    {
+                        std::vector<std::pair<int,int>> mergers;
+                        for(auto& [a,nbrs]:adj){
+                            auto stA=countryStates.find(a);
+                            if(stA==countryStates.end()||!stA->second.alive) continue;
+                            for(auto& [b,borderLen]:nbrs){
+                                if(b<=a) continue;
+                                auto stB=countryStates.find(b);
+                                if(stB==countryStates.end()||!stB->second.alive) continue;
+                                if(stA->second.cultureId!=stB->second.cultureId) continue;
+                                float sim=0.f;
+                                for(int at=0;at<CULT_ATTR_COUNT;++at)
+                                    sim+=stA->second.culturalAttrs[at]*stB->second.culturalAttrs[at];
+                                sim/=CULT_ATTR_COUNT;
+                                if(sim<0.8f) continue;
+                                int sA=cellCount.count(a)?cellCount[a]:0;
+                                int sB=cellCount.count(b)?cellCount[b]:0;
+                                if(sA==0||sB==0) continue;
+                                int smaller=(sA<sB)?a:b;
+                                int larger =(sA<sB)?b:a;
+                                mergers.push_back({smaller,larger});
+                            }
+                        }
+                        for(auto& [smaller,larger]:mergers){
+                            if(!countryStates.count(smaller)||!countryStates[smaller].alive) continue;
+                            if(!countryStates.count(larger) ||!countryStates[larger].alive)  continue;
+                            absorbCountry(smaller,larger,
+                                "Country "+std::to_string(smaller)+" voluntarily merged into "+std::to_string(larger));
                         }
                     }
 
-                    // Apply mergers
-                    for(auto& [smaller,larger]:mergers){
-                        // Reassign all cells
+                    // ── B. Diplomatic buyout / military dominance absorption ───
+                    //
+                    // A country can absorb a neighbour via two paths:
+                    //
+                    // PATH 1 — Gold buyout (peaceful):
+                    //   The buyer pays a "price" in Gold equal to:
+                    //     price = targetPop × 20 × isolationismMult × culturalDiscount
+                    //   where:
+                    //     isolationismMult = 1 + target.Isolationism × 1.5
+                    //       (high isolationism = very expensive; ≥2.0 → only conquest)
+                    //     culturalDiscount = 1 - culturalSimilarity × 0.5
+                    //       (same culture = up to 50% cheaper)
+                    //   Diplomacy tech gives the buyer a 30% discount.
+                    //   The buyer must have enough Gold AND the target must not be
+                    //   too isolationist (Isolationism < 2.0 for buyout to be possible).
+                    //
+                    // PATH 2 — Military dominance (forced):
+                    //   If the dominant country's military is ≥ 4× the weaker country's
+                    //   military AND the weaker country's average cohesion < 0.50,
+                    //   the dominant country can absorb the weaker one by force.
+                    //   No Gold cost, but the weaker country's Isolationism does NOT
+                    //   block this path (only conquest can take highly isolationist civs).
+                    {
+                        // Compute per-country average cohesion
+                        std::unordered_map<int,float> avgCoh;
+                        std::unordered_map<int,int>   cohCount;
                         for(int i=0;i<size*size;++i){
-                            CivCell& c=result.civCells[i];
-                            if(c.countryId==smaller){
-                                c.countryId=larger;
-                                c.cohesion=std::max(c.cohesion,0.5f); // merger boosts cohesion
+                            const CivCell& c=result.civCells[i];
+                            if(!c.settled||c.countryId<0) continue;
+                            avgCoh[c.countryId]+=c.cohesion;
+                            cohCount[c.countryId]++;
+                        }
+                        for(auto& [cid,v]:avgCoh)
+                            if(cohCount[cid]>0) v/=float(cohCount[cid]);
+
+                        // Cultural similarity: dot product of normalised attr vectors / CULT_ATTR_COUNT
+                        auto culturalSim=[&](const CountryState& sA, const CountryState& sB)->float{
+                            float sim=0.f;
+                            for(int at=0;at<CULT_ATTR_COUNT;++at)
+                                sim+=sA.culturalAttrs[at]*sB.culturalAttrs[at];
+                            return sim/CULT_ATTR_COUNT; // ~1.0 if identical
+                        };
+
+                        std::vector<std::pair<int,int>> absorptions; // (weak/target, dominant/buyer)
+                        for(auto& [a,nbrs]:adj){
+                            auto stAit=countryStates.find(a);
+                            if(stAit==countryStates.end()||!stAit->second.alive) continue;
+                            CountryState& stA=stAit->second;
+                            for(auto& [b,borderLen]:nbrs){
+                                if(b<=a) continue;
+                                auto stBit=countryStates.find(b);
+                                if(stBit==countryStates.end()||!stBit->second.alive) continue;
+                                CountryState& stB=stBit->second;
+
+                                float cohA=avgCoh.count(a)?avgCoh[a]:0.5f;
+                                float cohB=avgCoh.count(b)?avgCoh[b]:0.5f;
+                                float sim=culturalSim(stA,stB);
+
+                                // ── PATH 1: Gold buyout ───────────────────────
+                                // Try A buying B, then B buying A
+                                auto tryBuyout=[&](CountryState& buyer, CountryState& target,
+                                                   int buyerId, int targetId, float targetCoh)->bool{
+                                    // High isolationism blocks buyout entirely
+                                    float iso=target.culturalAttrs[int(CulturalAttr::Isolationism)];
+                                    if(iso>=settings.isolationismBuyoutBlock) return false;
+
+                                    // Price = targetPop × 20 × isolationismMult × culturalDiscount
+                                    float targetPop=0.f;
+                                    for(int i=0;i<size*size;++i){
+                                        const CivCell& c=result.civCells[i];
+                                        if(c.settled&&c.countryId==targetId) targetPop+=c.population;
+                                    }
+                                    float isolationismMult=1.f+iso*settings.isolationismPriceScale;
+                                    // Cultural discount: sim in [0,~1.0]; clamp discount to [0, maxDiscount]
+                                    float culturalDiscount=1.f-std::clamp(
+                                        sim*settings.culturalSimMaxDiscount,
+                                        0.f, settings.culturalSimMaxDiscount);
+                                    float price=targetPop*20.f*isolationismMult*culturalDiscount;
+
+                                    // Diplomacy tech gives configurable discount
+                                    if(buyer.techs[int(TechId::Diplomacy)])
+                                        price*=(1.f-settings.diplomacyTechDiscount);
+
+                                    // Buyer must have enough Gold
+                                    if(buyer.stockpile[int(ResourceType::Gold)]<price) return false;
+
+                                    // Target must have low enough cohesion to accept
+                                    if(targetCoh>settings.buyoutCohesionCap) return false;
+
+                                    // Pay the price
+                                    buyer.stockpile[int(ResourceType::Gold)]-=price;
+                                    absorptions.push_back({targetId,buyerId});
+                                    return true;
+                                };
+
+                                // Try A buying B
+                                if(!tryBuyout(stA,stB,a,b,cohB))
+                                    // Try B buying A
+                                    tryBuyout(stB,stA,b,a,cohA);
+
+                                // ── PATH 2: Military dominance ────────────────
+                                // Isolationism also affects military absorption:
+                                //   iso < isolationismBuyoutBlock → can be intimidated at 4× ratio
+                                //   iso >= isolationismBuyoutBlock → requires more military
+                                //     required ratio = 4 × (1 + (iso - block) × isolationismPriceScale)
+                                //   iso >= block + 1/isolationismPriceScale → effectively immune
+                                //     (ratio would need to be impossibly large)
+                                // No cultural similarity requirement — pure power.
+                                float milA=stA.militaryStr+stA.navyStr*0.5f;
+                                float milB=stB.militaryStr+stB.navyStr*0.5f;
+
+                                auto milDomRatio=[&](const CountryState& target)->float{
+                                    float iso=target.culturalAttrs[int(CulturalAttr::Isolationism)];
+                                    float block=settings.isolationismBuyoutBlock;
+                                    float scale=settings.isolationismPriceScale;
+                                    if(iso<block)
+                                        return 4.f; // base ratio for non-isolationist civs
+                                    // Each point above the block adds scale×4 to the required ratio
+                                    return 4.f*(1.f+(iso-block)*scale);
+                                };
+
+                                float ratioNeededForB=milDomRatio(stB);
+                                float ratioNeededForA=milDomRatio(stA);
+                                if(milA>=milB*ratioNeededForB && cohB<0.50f)
+                                    absorptions.push_back({b,a});
+                                else if(milB>=milA*ratioNeededForA && cohA<0.50f)
+                                    absorptions.push_back({a,b});
                             }
                         }
-                        // Mark smaller as dead
-                        auto it=countryStates.find(smaller);
-                        if(it!=countryStates.end()){
-                            // Transfer stockpiles
-                            auto& ls=countryStates[larger];
-                            for(int r=0;r<RESOURCE_COUNT;++r)
-                                ls.stockpile[r]=std::min(ls.stockpile[r]+it->second.stockpile[r],100.f);
-                            it->second.alive=false;
+                        // Deduplicate: a country can only be absorbed once
+                        std::unordered_map<int,bool> absorbed;
+                        for(auto& [weak,dominant]:absorptions){
+                            if(absorbed.count(weak)) continue;
+                            if(!countryStates.count(weak)||!countryStates[weak].alive) continue;
+                            if(!countryStates.count(dominant)||!countryStates[dominant].alive) continue;
+                            absorbed[weak]=true;
+                            absorbCountry(weak,dominant,
+                                "Country "+std::to_string(weak)+" absorbed by Country "+std::to_string(dominant));
                         }
-                        // Log merger event
-                        CivEvent ev;
-                        ev.tick=tick; ev.type=EventType::Merger;
-                        ev.countryId=larger; ev.countryId2=smaller;
-                        ev.note=std::string("Country ")+std::to_string(smaller)
-                               +" merged into "+std::to_string(larger);
-                        result.eventLog.push_back(ev);
+                    }
+
+                    // ── C. Military conquest with outcome roll ────────────────
+                    // Every 50 ticks, militaristic countries may launch a war against
+                    // a neighbour. The attacker spends Gold + Iron (or Niter) to fund
+                    // the campaign. A dice roll weighted by military ratio determines
+                    // the outcome on a 7-level scale:
+                    //
+                    //   6 = Very Successful  → attacker takes ALL of defender's land
+                    //   5 = Successful       → attacker takes defender's outer third
+                    //   4 = Somewhat Success → attacker takes defender's border third
+                    //   3 = Neutral          → no change, both lose some resources
+                    //   2 = Somewhat Failure → defender takes attacker's border third
+                    //   1 = Failure          → defender takes attacker's outer third
+                    //   0 = Catastrophic     → attacker loses ALL of its land to defender
+                    //
+                    // Attacker must have Militarism attr > 1.2 and enough Gold to fund.
+                    // War cost: 50 Gold + 20 Iron (or 15 Niter if Gunpowder tech).
+                    {
+                        std::mt19937 warRng(settings.seed^uint32_t(tick)*0xDEAD1234u);
+                        std::uniform_real_distribution<float> wd(0.f,1.f);
+
+                        // Track which countries have been attacked this cycle so they
+                        // can't also be the attacker (they're busy defending).
+                        std::unordered_map<int,bool> attackedThisCycle;
+
+                        for(auto& [a,nbrs]:adj){
+                            // Skip if this country was already attacked this cycle
+                            if(attackedThisCycle.count(a)) continue;
+
+                            auto stAit=countryStates.find(a);
+                            if(stAit==countryStates.end()||!stAit->second.alive) continue;
+                            CountryState& stA=stAit->second;
+
+                            float milAttrA = stA.culturalAttrs[int(CulturalAttr::Militarism)];
+                            // Militarism ranges ~[0.05, 2.5], average ~1.0.
+                            // A country will only go to war if it is willing to accept
+                            // the military risk implied by its militarism level.
+                            //
+                            // minRatio = required (attacker mil) / (defender mil) to declare war.
+                            // High militarism → willing to attack even stronger foes (ratio < 1).
+                            // Low militarism  → only attacks if heavily favoured (ratio >> 1).
+                            //
+                            // Formula: minRatio = 3.0 / (milAttr * 2.0 + 0.5)
+                            //   milAttr=0.05 → minRatio ≈ 5.0  (needs 5× advantage)
+                            //   milAttr=0.5  → minRatio ≈ 2.0  (needs 2× advantage)
+                            //   milAttr=1.0  → minRatio ≈ 1.2  (slight advantage needed)
+                            //   milAttr=1.5  → minRatio ≈ 0.86 (can attack slightly stronger)
+                            //   milAttr=2.0  → minRatio ≈ 0.67 (willing to attack 1.5× stronger)
+                            //   milAttr=2.5  → minRatio ≈ 0.55 (willing to attack nearly 2× stronger)
+                            //
+                            // Additionally, a country with very low militarism (<0.3) won't
+                            // declare war at all — it's a pacifist culture.
+                            if(milAttrA < 0.3f) continue;
+                            float minRatio = 3.0f / (milAttrA * 2.0f + 0.5f);
+
+                            // No hard resource requirement — any militaristic country can
+                            // declare war. Resources improve the outcome roll.
+                            bool hasIron  = stA.stockpile[int(ResourceType::Iron)]>=5.f;
+                            bool hasGold  = stA.stockpile[int(ResourceType::Gold)]>=10.f;
+                            bool hasNiter = stA.techs[int(TechId::Gunpowder)]
+                                         && stA.stockpile[int(ResourceType::Niter)]>=5.f;
+
+                            // Pick the best target: the neighbour with the most favourable
+                            // military ratio that still meets the minRatio threshold.
+                            // (Highly militaristic countries may target stronger neighbours.)
+                            int target=-1; float bestRatio=-1.f;
+                            for(auto& [b,borderLen]:nbrs){
+                                auto stBit=countryStates.find(b);
+                                if(stBit==countryStates.end()||!stBit->second.alive) continue;
+                                float milA2=stA.militaryStr+stA.navyStr*0.5f;
+                                float milB2=stBit->second.militaryStr+stBit->second.navyStr*0.5f+0.001f;
+                                float ratio=milA2/milB2;
+                                // Only consider targets where ratio meets the militarism threshold
+                                if(ratio < minRatio) continue;
+                                if(ratio > bestRatio){ bestRatio=ratio; target=b; }
+                            }
+                            if(target<0) continue;
+
+                            auto stBit=countryStates.find(target);
+                            if(stBit==countryStates.end()||!stBit->second.alive) continue;
+                            CountryState& stB=stBit->second;
+
+                            // Deduct war costs (small amounts — no hard gate)
+                            if(hasGold)  stA.stockpile[int(ResourceType::Gold)]-=10.f;
+                            if(hasNiter) stA.stockpile[int(ResourceType::Niter)]-=5.f;
+                            if(hasIron)  stA.stockpile[int(ResourceType::Iron)]-=5.f;
+
+                            // ── Outcome roll ──────────────────────────────────
+                            // Base probability of attacker winning = milA / (milA + milB)
+                            // Resources give a bonus to the attacker's effective military:
+                            //   Iron  +10%, Gold +10%, Niter +20% (gunpowder advantage)
+                            float milA=stA.militaryStr+stA.navyStr*0.5f;
+                            float milB=stB.militaryStr+stB.navyStr*0.5f;
+                            if(hasIron)  milA*=1.10f;
+                            if(hasGold)  milA*=1.10f;
+                            if(hasNiter) milA*=1.20f;
+                            float p=milA/(milA+milB+0.001f); // attacker win probability [0,1]
+
+                            float r=wd(warRng);
+                            int outcome;
+                            if     (r < p*p)              outcome=6; // very successful
+                            else if(r < p*1.5f)           outcome=5; // successful
+                            else if(r < p*2.0f)           outcome=4; // somewhat successful
+                            else if(r < p*2.0f+0.10f)     outcome=3; // neutral
+                            else if(r < p*2.0f+0.25f)     outcome=2; // somewhat failure
+                            else if(r < p*2.0f+0.45f)     outcome=1; // failure
+                            else                           outcome=0; // catastrophic
+
+                            // Clamp to valid range
+                            outcome=std::clamp(outcome,0,6);
+
+                            std::string outcomeStr;
+                            switch(outcome){
+                                case 6: outcomeStr="Very Successful";  break;
+                                case 5: outcomeStr="Successful";       break;
+                                case 4: outcomeStr="Somewhat Success"; break;
+                                case 3: outcomeStr="Neutral";          break;
+                                case 2: outcomeStr="Somewhat Failure"; break;
+                                case 1: outcomeStr="Failure";          break;
+                                default:outcomeStr="Catastrophic";     break;
+                            }
+
+                            // Mark both attacker and target as busy this cycle
+                            attackedThisCycle[target] = true;
+                            attackedThisCycle[a]      = true;
+
+                            // Apply outcome
+                            if(outcome==6){
+                                // Attacker takes everything
+                                absorbCountry(target,a,
+                                    "War: Country "+std::to_string(a)+" conquered Country "
+                                    +std::to_string(target)+" ("+outcomeStr+")");
+                            } else if(outcome==5){
+                                // Attacker takes defender's outer third (border cells)
+                                transferBorderCells(target,a,0.67f);
+                                CivEvent ev; ev.tick=tick; ev.type=EventType::Conquest;
+                                ev.countryId=a; ev.countryId2=target;
+                                ev.note="War: "+std::to_string(a)+" vs "+std::to_string(target)
+                                       +" — "+outcomeStr+" (took 2/3 of border)";
+                                result.eventLog.push_back(ev);
+                            } else if(outcome==4){
+                                // Attacker takes defender's border third
+                                transferBorderCells(target,a,0.33f);
+                                CivEvent ev; ev.tick=tick; ev.type=EventType::Conquest;
+                                ev.countryId=a; ev.countryId2=target;
+                                ev.note="War: "+std::to_string(a)+" vs "+std::to_string(target)
+                                       +" — "+outcomeStr+" (took 1/3 of border)";
+                                result.eventLog.push_back(ev);
+                            } else if(outcome==3){
+                                // Neutral: both lose some resources
+                                stA.stockpile[int(ResourceType::Iron)]=
+                                    std::max(0.f,stA.stockpile[int(ResourceType::Iron)]-10.f);
+                                stB.stockpile[int(ResourceType::Iron)]=
+                                    std::max(0.f,stB.stockpile[int(ResourceType::Iron)]-10.f);
+                                CivEvent ev; ev.tick=tick; ev.type=EventType::Conquest;
+                                ev.countryId=a; ev.countryId2=target;
+                                ev.note="War: "+std::to_string(a)+" vs "+std::to_string(target)
+                                       +" — "+outcomeStr+" (stalemate)";
+                                result.eventLog.push_back(ev);
+                            } else if(outcome==2){
+                                // Defender takes attacker's border third
+                                transferBorderCells(a,target,0.33f);
+                                CivEvent ev; ev.tick=tick; ev.type=EventType::Conquest;
+                                ev.countryId=target; ev.countryId2=a;
+                                ev.note="War: "+std::to_string(a)+" vs "+std::to_string(target)
+                                       +" — "+outcomeStr+" (attacker lost 1/3 of border)";
+                                result.eventLog.push_back(ev);
+                            } else if(outcome==1){
+                                // Defender takes attacker's outer third
+                                transferBorderCells(a,target,0.67f);
+                                CivEvent ev; ev.tick=tick; ev.type=EventType::Conquest;
+                                ev.countryId=target; ev.countryId2=a;
+                                ev.note="War: "+std::to_string(a)+" vs "+std::to_string(target)
+                                       +" — "+outcomeStr+" (attacker lost 2/3 of border)";
+                                result.eventLog.push_back(ev);
+                            } else { // outcome==0: catastrophic
+                                // Attacker loses everything to defender
+                                absorbCountry(a,target,
+                                    "War: Country "+std::to_string(a)+" catastrophically lost to "
+                                    +std::to_string(target)+" ("+outcomeStr+")");
+                            }
+
+                        }
                     }
                 }
 
-                // ── Sea traversal: update effectiveTraversability ─────────────
-                // Countries with Navigation or Sailing tech can use sea routes.
-                // Coastal cells (seaAccess > 0.3) get a traversability bonus.
+                // ── Sea & mountain traversal: update effectiveTraversability ──
+                // Sailing/Navigation/Colonialism: coastal cells get traversability bonus.
+                // Engineering/Mountaineering: mountain cells get traversability bonus.
                 for(int i=0;i<size*size;++i){
                     CivCell& c=result.civCells[i];
                     if(!c.settled||c.countryId<0) continue;
                     auto stIt=countryStates.find(c.countryId);
-                    float seaBonus=0.f;
+                    float seaBonus=0.f, mountBonus=0.f;
                     if(stIt!=countryStates.end()){
                         const CountryState& st=stIt->second;
-                        if(st.techs[int(TechId::Sailing)])    seaBonus=c.seaAccess*0.2f;
-                        if(st.techs[int(TechId::Navigation)]) seaBonus=c.seaAccess*0.4f;
+                        // Sea bonuses: coastal cells become easier to connect
+                        if(st.techs[int(TechId::Sailing)])     seaBonus=c.seaAccess*0.20f;
+                        if(st.techs[int(TechId::Navigation)])  seaBonus=c.seaAccess*0.40f;
+                        if(st.techs[int(TechId::Colonialism)]) seaBonus=c.seaAccess*0.65f;
+                        // Mountain bonuses: low-traversability cells become cheaper to cross
+                        // Only applies to cells that are actually mountainous (trav < 0.35)
+                        float mountainness=std::clamp((0.35f-c.traversability)/0.35f,0.f,1.f);
+                        if(st.techs[int(TechId::Engineering)])    mountBonus=mountainness*0.15f;
+                        if(st.techs[int(TechId::Mountaineering)]) mountBonus=mountainness*0.40f;
                     }
-                    c.effectiveTraversability=std::clamp(c.traversability+seaBonus,0.f,1.f);
+                    c.effectiveTraversability=std::clamp(c.traversability+seaBonus+mountBonus,0.f,1.f);
+                }
+
+                // ── Sea expansion: Sailing/Navigation/Colonialism lets civs ──
+                // spread across ocean cells to reach distant coasts.
+                // Sailing: can settle 1 ocean cell away (island hopping)
+                // Navigation: can settle 3 ocean cells away
+                // Colonialism: can settle up to 8 ocean cells away (long-range colonisation)
+                {
+                    std::vector<std::pair<int,int>> seaSettled; // (target land cell, source cell)
+                    for(int y2=1;y2<size-1;++y2)
+                    for(int x2=0;x2<size;++x2){
+                        int i=y2*size+x2;
+                        CivCell& c=result.civCells[i];
+                        if(!c.settled||c.population<1.0f) continue; // need decent pop to colonise
+                        auto stIt=countryStates.find(c.countryId);
+                        if(stIt==countryStates.end()) continue;
+                        const CountryState& st=stIt->second;
+
+                        // Determine sea range based on tech
+                        int seaRange=0;
+                        if(st.techs[int(TechId::Colonialism)]) seaRange=8;
+                        else if(st.techs[int(TechId::Navigation)]) seaRange=3;
+                        else if(st.techs[int(TechId::Sailing)])    seaRange=1;
+                        if(seaRange==0) continue;
+
+                        // BFS through ocean cells up to seaRange steps
+                        // to find reachable unsettled land cells
+                        std::vector<int> frontier; frontier.push_back(i);
+                        std::vector<bool> visited(size*size,false);
+                        visited[i]=true;
+                        for(int step=0;step<seaRange;++step){
+                            std::vector<int> next;
+                            for(int cur:frontier){
+                                int cy2=cur/size, cx2=cur%size;
+                                for(int d=0;d<4;++d){
+                                    int nx2=((cx2+ndx4[d])%size+size)%size;
+                                    int ny2=std::clamp(cy2+ndy4[d],0,size-1);
+                                    int ni=ny2*size+nx2;
+                                    if(visited[ni]) continue;
+                                    visited[ni]=true;
+                                    CivCell& nc=result.civCells[ni];
+                                    if(nc.isOcean){
+                                        // Continue BFS through ocean
+                                        next.push_back(ni);
+                                    } else if(!nc.settled && nc.habitability>=spreadThr){
+                                        // Found a reachable unsettled land cell
+                                        // Colonisation probability: lower than land spread
+                                        float prob=0.02f*(1.f+float(seaRange)*0.1f);
+                                        if(roll(civRng)<prob)
+                                            seaSettled.push_back({ni,i});
+                                    }
+                                }
+                            }
+                            frontier=std::move(next);
+                            if(frontier.empty()) break;
+                        }
+                    }
+                    // Apply sea settlements
+                    for(auto& [ni,si]:seaSettled){
+                        CivCell& nc=result.civCells[ni];
+                        CivCell& sc=result.civCells[si];
+                        if(!nc.settled){
+                            nc.settled=true;
+                            nc.population=0.3f;
+                            nc.culture=0.05f;
+                            nc.cohesion=0.6f; // colonies start with lower cohesion
+                            nc.cultureId=sc.cultureId;
+                            nc.countryId=sc.countryId;
+                        }
+                    }
+                }
+
+                // ── Mountain expansion: Engineering/Mountaineering lets civs ──
+                // settle through high-elevation cells that would normally block spread.
+                // Engineering: can settle mountain cells at reduced probability
+                // Mountaineering: can settle mountain cells at normal probability
+                {
+                    std::vector<std::pair<int,int>> mountSettled;
+                    for(int y2=1;y2<size-1;++y2)
+                    for(int x2=0;x2<size;++x2){
+                        int i=y2*size+x2;
+                        CivCell& c=result.civCells[i];
+                        if(!c.settled||c.population<0.5f) continue;
+                        auto stIt=countryStates.find(c.countryId);
+                        if(stIt==countryStates.end()) continue;
+                        const CountryState& st=stIt->second;
+
+                        bool hasEngineering    = st.techs[int(TechId::Engineering)];
+                        bool hasMountaineering = st.techs[int(TechId::Mountaineering)];
+                        if(!hasEngineering && !hasMountaineering) continue;
+
+                        for(int d=0;d<4;++d){
+                            int nx2=((x2+ndx4[d])%size+size)%size;
+                            int ny2=std::clamp(y2+ndy4[d],0,size-1);
+                            int ni=ny2*size+nx2;
+                            CivCell& nc=result.civCells[ni];
+                            if(nc.settled||nc.isOcean) continue;
+                            // Only target mountainous cells (low traversability)
+                            if(nc.traversability>0.35f) continue;
+                            // Habitability check (mountains can still be habitable)
+                            if(nc.habitability<spreadThr*0.5f) continue;
+
+                            float prob=0.f;
+                            if(hasMountaineering) prob=0.08f; // good chance with full tech
+                            else if(hasEngineering) prob=0.02f; // slow with just Engineering
+                            if(roll(civRng)<prob)
+                                mountSettled.push_back({ni,i});
+                        }
+                    }
+                    for(auto& [ni,si]:mountSettled){
+                        CivCell& nc=result.civCells[ni];
+                        CivCell& sc=result.civCells[si];
+                        if(!nc.settled){
+                            nc.settled=true;
+                            nc.population=0.2f;
+                            nc.culture=0.05f;
+                            nc.cohesion=0.7f;
+                            nc.cultureId=sc.cultureId;
+                            nc.countryId=sc.countryId;
+                        }
+                    }
                 }
             } // end tick%10 block
 
@@ -1964,6 +2620,7 @@ MapResult generateMap(const GeneratorSettings& settings)
                 snap2.totalPop=totPop;
                 snap2.settledCells=settledN;
                 snap2.cultureGroups=int(std::count(cultSeen.begin(),cultSeen.end(),true));
+                snap2.countryCount=int(countrySeen.size());
 
                 // ── Pass 1: country fill + borders ────────────────────────────
                 for(int y2=0;y2<size;++y2)
@@ -2111,6 +2768,20 @@ MapResult generateMap(const GeneratorSettings& settings)
                         info.scienceRate=st.scienceRate;
                         info.income=st.income;
                         info.tradeVolume=st.tradeVolume;
+                        // Military
+                        info.militaryStr=st.militaryStr;
+                        info.navyStr=st.navyStr;
+                        info.swordsmenStr=st.swordsmenStr;
+                        info.gunmenStr=st.gunmenStr;
+                        info.arcaneStr=st.arcaneStr;
+                        // Great people
+                        info.greatPeople.clear();
+                        for(const GreatPerson& gp:st.greatPeople)
+                            if(gp.alive) info.greatPeople.push_back(gp);
+                        info.greatPersonTotal=int(st.greatPeople.size());
+                        info.arcanePersonTotal=0;
+                        for(const GreatPerson& gp:st.greatPeople)
+                            if(isArcaneGreatPerson(gp.type)) info.arcanePersonTotal++;
                     }
                     result.civInfos.push_back(info);
                 }

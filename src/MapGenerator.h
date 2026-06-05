@@ -24,9 +24,48 @@ struct GeneratorSettings
     int   civSnapshots      = 20;
 
     // Cohesion settings
-    float cohesionStrength  = 0.7f;
-    float cohesionHalfLife  = 0.07f;
-    float cohesionLerpRate  = 0.025f;
+    float cohesionStrength  = 0.87f;
+    float cohesionHalfLife  = 0.09f;
+    float cohesionLerpRate  = 0.04f;
+
+    // Great People settings
+    // Military great people: accumulate points from pop × militarism × resource bonus
+    float gpMilFrequency    = 1.0f;   // multiplier on military GP spawn rate (0=never, 2=double)
+    float gpMilPowerMin     = 0.15f;  // minimum power roll for military great people [0,1]
+    float gpMilPowerMax     = 0.60f;  // maximum power roll for military great people [0,1]
+
+    // Arcane great people: accumulate points from ManaStone stockpile × Arcane tech
+    float gpArcaneFrequency = 1.0f;   // multiplier on arcane GP spawn rate (rarer than military)
+    float gpArcanePowerMin  = 0.30f;  // minimum power roll for arcane great people [0,1]
+    float gpArcanePowerMax  = 0.90f;  // maximum power roll for arcane great people [0,1]
+
+    // Harbinger: extremely rare legendary arcane figure
+    float gpHarbingerChance = 0.05f;  // probability [0,1] that an arcane GP is a Harbinger
+
+    // Diplomacy / buyout settings
+    // isolationismBuyoutBlock: Isolationism value at or above which buyout is impossible.
+    //   Default 0.5 (low threshold — most isolationist civs resist buyout).
+    //   Set higher (e.g. 2.5) to allow buying even very isolationist civs.
+    float isolationismBuyoutBlock  = 0.5f;
+
+    // culturalSimMaxDiscount: maximum Gold discount from cultural similarity [0,1].
+    //   Default 0.5 (50% off for identical cultures).
+    //   Set to 0 to disable cultural discounts entirely.
+    float culturalSimMaxDiscount   = 0.5f;
+
+    // diplomacyTechDiscount: Gold discount multiplier when buyer has Diplomacy tech [0,1].
+    //   Default 0.30 (30% off).
+    float diplomacyTechDiscount    = 0.30f;
+
+    // buyoutCohesionCap: target's average cohesion must be below this to accept buyout.
+    //   Default 0.65 (only fragile/unstable countries can be bought).
+    //   Set higher to allow buying stable countries (at great cost).
+    float buyoutCohesionCap        = 0.65f;
+
+    // isolationismPriceScale: multiplier on how much Isolationism inflates the price.
+    //   price *= (1 + Isolationism * isolationismPriceScale)
+    //   Default 1.5 — each point of Isolationism adds 150% to the base price.
+    float isolationismPriceScale   = 1.5f;
 };
 
 // Render layers
