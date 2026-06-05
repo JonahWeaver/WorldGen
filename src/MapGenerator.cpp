@@ -1235,7 +1235,7 @@ MapResult generateMap(const GeneratorSettings& settings)
         // Culture palette: distinct hues per culture group.
         // Country palette: derived from culture hue but with varied lightness.
         const int maxCultures=plateCount*2+4;
-        const int maxCountries=10000;
+        const int maxCountries=100000;
         std::vector<uint32_t> cultPalette;
         cultPalette.reserve(maxCultures);
         for(int i=0;i<maxCultures;++i)
